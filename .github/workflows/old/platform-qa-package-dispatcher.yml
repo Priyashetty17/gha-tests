@@ -1,0 +1,118 @@
+name: Platform QA Package Dispatcher
+
+on:
+  workflow_dispatch:
+    inputs:
+      rancher_host:
+        description: "Rancher cluster host (e.g. mycluster.qa.rancher.space)"
+        required: true
+      admin_token:
+        description: "Admin token for Rancher API access"
+        required: true
+      cluster_name:
+        description: "Downstream cluster name"
+        required: true
+      test_packages:
+        description: "Comma-separated test package paths (e.g. validation/rbac,validation/projects)"
+        required: true
+      run_all_tests:
+        description: "Run all test files in the package?"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      recursive_tests:
+        description: "Recursively find and run tests in sub-packages?"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      test_selector:
+        description: "Test suite or test name regex (e.g. ^TestSuiteName$ or ^TestSuite/TestCase$), if run_all_tests=false"
+        required: false
+      exclude_test_files:
+        description: "Test files to exclude (comma-separated), if run_all_tests=true (e.g. rbac_test.go,projects_test.go)"
+        required: false
+      report_to_qase:
+        description: "Enable Qase reporting"
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+      qase_test_run_id:
+        description: "Qase Test Run ID, if report_to_qase=true"
+        required: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Clone rancher/tests repo
+        run: |
+          git clone https://github.com/rancher/tests.git rancher-tests
+          ls -al rancher-tests
+
+      - name: Flatten package list (only if recursive)
+        id: flatten
+        if: ${{ github.event.inputs.recursive_tests == 'true' }}
+        run: |
+          INPUT_PKGS="${{ github.event.inputs.test_packages }}"
+          FLATTENED=()
+          declare -A unique_packages
+          
+          IFS=',' read -ra PKGS <<< "$INPUT_PKGS"
+          for pkg in "${PKGS[@]}"; do
+            DIRS=$(find "rancher-tests/$pkg" -type f -name '*_test.go' \
+              -printf '%h\n' | sort -u | sed "s|^rancher-tests/||")
+
+            if [ -n "$DIRS" ]; then
+              while IFS= read -r dir; do
+                unique_packages["$dir"]=1
+              done <<< "$DIRS"
+            fi
+          done
+
+          FLAT_LIST=$(IFS=','; echo "${!unique_packages[*]}")
+          
+          echo "Flattened list: $FLAT_LIST"
+          echo "test_packages=$FLAT_LIST" >> $GITHUB_OUTPUT
+
+      - name: Dispatch Package Runner
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const workflow_id = "platform-qa-package-runner.yml";
+            const ref = "main";
+
+            const test_packages = "${{ steps.flatten.outputs.test_packages || github.event.inputs.test_packages }}";
+
+            const inputs = {
+              rancher_host: "${{ github.event.inputs.rancher_host }}",
+              admin_token: "${{ github.event.inputs.admin_token }}",
+              cluster_name: "${{ github.event.inputs.cluster_name }}",
+              test_packages,
+              run_all_tests: "${{ github.event.inputs.run_all_tests }}",
+              recursive_tests: "${{ github.event.inputs.recursive_tests }}",
+              test_selector: "${{ github.event.inputs.test_selector }}",
+              exclude_test_files: "${{ github.event.inputs.exclude_test_files }}",
+              report_to_qase: "${{ github.event.inputs.report_to_qase }}",
+              qase_test_run_id: "${{ github.event.inputs.qase_test_run_id }}"
+            };
+
+            console.log("🚀 Dispatching runner with packages:", test_packages);
+
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id,
+              ref,
+              inputs
+            });

@@ -1,0 +1,230 @@
+name: OLD Platform QA Multi-Package Test Runner with Qase Reporting
+
+on:
+  workflow_dispatch:
+    inputs:
+      rancher_host:
+        description: "Rancher cluster host (e.g. mycluster.qa.rancher.space)"
+        required: true
+      admin_token:
+        description: "Admin token for Rancher API access"
+        required: true
+      cluster_name:
+        description: "Downstream cluster name"
+        required: true
+      test_packages:
+        description: "Comma-separated test package paths (e.g. validation/rbac,validation/projects)"
+        required: true
+      run_all_tests:
+        description: "Run all test files in the package?"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      test_selector:
+        description: "Test suite or test name regex (e.g. ^TestSuiteName$ or ^TestSuite/TestCase$), if run_all_tests=false"
+        required: false
+      exclude_test_files:
+        description: "Test files to exclude (comma-separated), if run_all_tests=true (e.g. rbac_test.go,projects_test.go)"
+        required: false
+      report_to_qase:
+        description: "Enable Qase reporting"
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+      qase_test_run_id:
+        description: "Qase Test Run ID, , if report_to_qase=true"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY_NAME: ${{ vars.REGISTRY_NAME }}
+  REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+  REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  RANCHER_ADMIN_PASSWORD: ${{ secrets.RANCHER_ADMIN_PASSWORD }}
+
+jobs:
+  run-tests:
+    runs-on: ubuntu-latest
+    env:
+      RANCHER_HOST: ${{ github.event.inputs.rancher_host }}
+      RANCHER_ADMIN_TOKEN: ${{ github.event.inputs.admin_token }}
+      CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}
+      TEST_PACKAGES: ${{ github.event.inputs.test_packages }}
+      RUN_ALL_TESTS: ${{ github.event.inputs.run_all_tests }}
+      EXCLUDE_TEST_FILES: ${{ github.event.inputs.exclude_test_files }}
+      TEST_SELECTOR: ${{ github.event.inputs.test_selector }}
+      REPORT_TO_QASE: ${{ github.event.inputs.report_to_qase }}
+      QASE_TEST_RUN_ID: ${{ github.event.inputs.qase_test_run_id }}
+      QASE_AUTOMATION_TOKEN: ${{ secrets.QASE_TOKEN }}
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
+      - name: Clone rancher/tests repo
+        run: |
+          git clone https://github.com/rancher/tests.git rancher-tests
+          ls -al rancher-tests
+
+      - name: Create cattle config
+        run: |
+          cat > cattle-config.yaml <<EOF
+          rancher:
+            host: "${RANCHER_HOST}"
+            adminToken: "${RANCHER_ADMIN_TOKEN}"
+            cleanup: true
+            insecure: true
+            clusterName: "${CLUSTER_NAME}"
+            adminPassword: "${RANCHER_ADMIN_PASSWORD}"
+
+          registryInput:
+            name: "${REGISTRY_NAME}"
+            username: "${REGISTRY_USERNAME}"
+            password: "${REGISTRY_PASSWORD}"
+
+          awsCredentials:
+            accessKey: "${{ secrets.AWS_ACCESS_KEY_ID }}"
+            secretKey: "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+            defaultRegion: "us-east-2"
+
+          clusterConfig:
+            machinePools:
+            - machinePoolConfig:
+                etcd: true
+                controlplane: true
+                worker: true
+                quantity: 1
+                drainBeforeDelete: true
+                hostnameLengthLimit: 29
+                nodeStartupTimeout: "600s"
+                unhealthyNodeTimeout: "300s"
+                maxUnhealthy: "2"
+                unhealthyRange: "2-4"
+            kubernetesVersion: "v1.32.7+k3s1"
+            provider: "aws"
+            cni: "calico"
+            nodeProvider: "ec2"
+            hardened: false
+
+          awsMachineConfigs:
+            region: "us-east-2"
+            awsMachineConfig:
+            - roles: ["etcd","controlplane","worker"]
+              ami: "ami-012fd49f6b0c404c7"
+              instanceType: "t3a.xlarge"
+              sshUser: "ubuntu"
+              vpcId: "vpc-bfccf4d7"
+              volumeType: "gp2"
+              zone: "a"
+              retries: "5"
+              rootSize: "100"
+              securityGroup: ["qa_default_ipv4"]
+          EOF
+
+      - name: Run each test package and report
+        working-directory: rancher-tests
+        env:
+          CATTLE_TEST_CONFIG: ${{ github.workspace }}/cattle-config.yaml
+        run: |
+          CLEANED_TEST_PACKAGES=$(echo "$TEST_PACKAGES" | tr -d ' ')
+          IFS=',' read -ra PACKAGES <<< "$CLEANED_TEST_PACKAGES"
+
+          for PACKAGE in "${PACKAGES[@]}"; do
+            echo "🔎 Testing package: $PACKAGE"
+            cd "$PACKAGE" || { echo "❌ Package $PACKAGE not found"; cd ..; continue; }
+
+            if [ "$RUN_ALL_TESTS" = "true" ]; then
+              ALL_TEST_FILES=$(ls *_test.go 2>/dev/null | grep -E -v '(^_deprecated_|^deprecated_)' || true)
+              echo "ALL_TEST_FILES (before exclusions): '$ALL_TEST_FILES'"
+
+              FILTERED_TEST_FILES="$ALL_TEST_FILES"
+              if [ -n "$EXCLUDE_TEST_FILES" ]; then
+                EXCLUDE_PATTERN_FILE=$(mktemp)
+                echo "$EXCLUDE_TEST_FILES" | tr ',' '\n' > "$EXCLUDE_PATTERN_FILE"
+                FILTERED_TEST_FILES=$(echo "$FILTERED_TEST_FILES" | tr ' ' '\n' | grep -x -v -f "$EXCLUDE_PATTERN_FILE" | tr '\n' ' ' || true)
+                rm "$EXCLUDE_PATTERN_FILE"
+              fi
+
+              FILTERED_TEST_FILES=$(echo "$FILTERED_TEST_FILES" | xargs)
+              echo "FILTERED_TEST_FILES (after exclusions): '$FILTERED_TEST_FILES'"
+
+              if [ -z "$FILTERED_TEST_FILES" ]; then
+                echo "⚠️ No test files found after applying filters for package: $PACKAGE"
+                cd "${GITHUB_WORKSPACE}/rancher-tests"
+                continue
+              fi
+
+              NON_TEST_GO_FILES=$(ls *.go 2>/dev/null | grep -v '_test.go' || true)
+              FILES_TO_COMPILE_AND_RUN="$FILTERED_TEST_FILES $NON_TEST_GO_FILES"
+              echo "FILES_TO_COMPILE_AND_RUN: '$FILES_TO_COMPILE_AND_RUN'"
+
+              TAGS="validation"
+              echo "🧪 Running filtered test files in package: $PACKAGE"
+              echo "   Files: $FILTERED_TEST_FILES"
+              echo "   With tags: $TAGS"
+
+              gotestsum \
+                --format=standard-verbose \
+                --junitfile "$GITHUB_WORKSPACE/rancher-tests/results.xml" \
+                --jsonfile "$GITHUB_WORKSPACE/rancher-tests/results.json" \
+                -- -v -tags="$TAGS" -timeout 5h $FILES_TO_COMPILE_AND_RUN || echo "⚠️ Test failed in $PACKAGE"
+            else
+              if [ -z "$TEST_SELECTOR" ]; then
+                echo "❌ test_selector input is required when run_all_tests is false"
+                cd "${GITHUB_WORKSPACE}/rancher-tests"
+                continue
+              fi
+
+              TAGS="validation"
+
+              echo "▶ Running selector: '$TEST_SELECTOR' with tags: $TAGS (for package: $PACKAGE)"
+              gotestsum \
+                --format=standard-verbose \
+                --junitfile "$GITHUB_WORKSPACE/rancher-tests/results.xml" \
+                --jsonfile "$GITHUB_WORKSPACE/rancher-tests/results.json" \
+                --packages="github.com/rancher/tests/$PACKAGE" \
+                -- -v -tags="$TAGS" -timeout 5h -run "$TEST_SELECTOR" || echo "⚠️ Test failed in $PACKAGE"
+            fi
+
+            if [ "$REPORT_TO_QASE" = "true" ] && [ -n "$QASE_TEST_RUN_ID" ]; then
+              echo "📤 Reporting to Qase"
+              export QASE_TEST_RUN_ID="$QASE_TEST_RUN_ID"
+              export QASE_AUTOMATION_TOKEN="$QASE_AUTOMATION_TOKEN"
+
+              RESULTS_DIR=$(mktemp -d "${GITHUB_WORKSPACE}/rancher-tests/resultsdir-XXXXXX")
+              cp "${GITHUB_WORKSPACE}/rancher-tests/results.json" "$RESULTS_DIR/results.json"
+
+              echo "🔧 Building Qase reporter"
+              chmod +x "${GITHUB_WORKSPACE}/rancher-tests/validation/pipeline/scripts/build_qase_reporter.sh"
+              "${GITHUB_WORKSPACE}/rancher-tests/validation/pipeline/scripts/build_qase_reporter.sh" || exit 1
+
+              REPORTER_PATH="${GITHUB_WORKSPACE}/rancher-tests/validation/reporter"
+              if [ ! -f "$REPORTER_PATH" ]; then
+                echo "❌ Reporter binary not found at $REPORTER_PATH"
+                exit 1
+              fi
+
+              cd "$RESULTS_DIR"
+              echo "🚀 Running reporter"
+              chmod +x "$REPORTER_PATH"
+              "$REPORTER_PATH" --results results.json
+            fi
+
+            echo "🧹 Cleaning up old result files"
+            rm -f "${GITHUB_WORKSPACE}/rancher-tests/results.xml" "${GITHUB_WORKSPACE}/rancher-tests/results.json"
+            cd "${GITHUB_WORKSPACE}/rancher-tests"
+          done
