@@ -1,0 +1,828 @@
+name: Provision Rancher HA and Node Driver Provisioned Downstream RKE2
+
+on:
+  workflow_dispatch:
+    inputs:
+      rancher_hostname_prefix:
+        description: 'Prefix to use for Rancher'
+        default: 'testcluster'
+      rancher_helm_url:
+        description: 'URL for the Rancher Helm chart repository'
+        required: false
+        default: 'https://releases.rancher.com/server-charts/'
+      rancher_helm_repo:
+        description: 'Rancher Helm Repository (e.g., latest, alpha, prime)'
+        required: false
+        default: 'latest'
+      rancher_helm_extra_settings:
+        description: 'Additional settings for Rancher Helm chart in JSON/YAML format (e.g., {"rancherImage":"registry.rancher.com/rancher/rancher"})'
+        required: false
+        default: '{}'
+      rancher_chart_version:
+        description: 'Rancher version to install (e.g., v2.12.0)'
+        required: true
+      rancher_image_tag:
+        description: 'Image tag for the Rancher Helm chart (e.g., head, v2.11-head, v2.12-head)'
+        required: false
+        default: ''
+      kubernetes_version: 
+        description: 'Kubernetes version for RKE2 (e.g., v1.32.7+rke2r1)'
+        default: 'v1.32.7+rke2r1'
+      cert_manager_version: 
+        description: 'Cert manager version (e.g., v1.17.3)'
+        default: 'v1.17.3'
+      rancher_terraform_provider_version:
+        description: 'Version of the rancher2 Terraform provider to use (e.g., 8.0.0 if the rancher version is v2.12.0)'
+        required: true
+        default: '8.0.0'
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  RANCHER_ADMIN_PASSWORD: ${{ secrets.RANCHER_ADMIN_PASSWORD }}
+  SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+  AWS_REGION: "us-east-2"
+  AWS_AMI: "ami-012fd49f6b0c404c7"
+  AWS_SUBNET: "subnet-ee8cac86"
+  AWS_VPC: "vpc-bfccf4d7"
+  AWS_SECURITY_GROUP: "sg-08e8243a8cfbea8a0"
+  AWS_INSTANCE_TYPE: "t3a.xlarge"
+  AWS_VOLUME_SIZE: 100
+  KUBECONFIG: /tmp/kubeconfig-${{ github.event.inputs.rancher_hostname_prefix }}.yaml
+  AWS_VOLUME_TYPE: "gp3"
+  AWS_AVAILABILITY_ZONE: "us-east-2a" 
+  AWS_IAM_INSTANCE_PROFILE: ""
+  
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    name: Provision Rancher HA and Downstream RKE2
+    
+    outputs:
+      ssh-key-name: ${{ steps.provision-cluster.outputs.ssh-key-name }}
+      fqdn-main-node: ${{ steps.provision-cluster.outputs.fqdn-main-node }}
+      all-node-public-dns: ${{ steps.provision-cluster.outputs.all-node-public-dns }}
+      tf-state-dir: ${{ steps.provision-cluster.outputs.tf-state-dir }}
+      tf-state-dir-ds: ${{ steps.provision-ds-cluster.outputs.tf-state-dir-ds }}
+      downstream-ip: ${{ steps.provision-ds-cluster.outputs.downstream-ip }}
+      api-key: ${{ steps.rancher-token.outputs.api-key }}
+    
+    env:
+      TF_MODULES_PATH: ${{ github.workspace }}/infra
+
+    steps:
+      - name: Checkout self
+        uses: actions/checkout@v4
+
+      - name: Checkout QA infra repo
+        uses: actions/checkout@v4
+        with:
+          repository: rancher/qa-infra-automation
+          path: infra
+
+      - name: Install dependencies (Tofu, Ansible, Helm, kubectl, yq, Python)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip jq python3-pip ansible curl wget git python3-venv
+          pip3 install --user pipx
+          python3 -m pipx ensurepath
+          pipx install ansible-core
+          pipx inject ansible-core kubernetes boto3 python-terraform python-hcl2
+          
+          # Install OpenTofu
+          TOFU_VERSION=$(curl -s https://api.github.com/repos/opentofu/opentofu/releases/latest | jq -r '.tag_name')
+          TOFU_VER_CLEAN=${TOFU_VERSION#v}
+          wget https://github.com/opentofu/opentofu/releases/download/${TOFU_VERSION}/tofu_${TOFU_VER_CLEAN}_linux_amd64.tar.gz
+          tar -xzf tofu_${TOFU_VER_CLEAN}_linux_amd64.tar.gz
+          sudo mv tofu /usr/local/bin/
+          sudo ln -s /usr/local/bin/tofu /usr/local/bin/terraform
+          
+          # Helm
+          curl -s https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          
+          # kubectl
+          curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin
+          
+          # yq
+          sudo wget https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64 -O /usr/local/bin/yq
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Install Ansible Collections
+        run: |
+          PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+          PYTHON_USER_BASE=$(python3 -m site --user-base)
+          COLLECTION_INSTALL_PATH="$PYTHON_USER_BASE/lib/python$PYTHON_VERSION/site-packages/ansible_collections"
+          
+          mkdir -p "$COLLECTION_INSTALL_PATH"
+          echo "Attempting to install collections to: $COLLECTION_INSTALL_PATH"
+
+          echo "Ansible --version for collection install:"
+          ansible --version 
+
+          ANSIBLE_COLLECTIONS_PATH="$COLLECTION_INSTALL_PATH" ansible-galaxy collection install \
+            community.general \
+            community.aws \
+            cloud.terraform \
+            -p "$COLLECTION_INSTALL_PATH" \
+            --force
+
+          echo "Verifying installation:"
+          ANSIBLE_COLLECTIONS_PATH="$COLLECTION_INSTALL_PATH" ansible-galaxy collection list
+
+          LOOKUP_FILE="$COLLECTION_INSTALL_PATH/cloud/terraform/plugins/lookup/tf_output.py"
+          echo "Checking for lookup plugin file at standard path: $LOOKUP_FILE"
+          ls -l "$LOOKUP_FILE" || { echo "ERROR: tf_output.py not found at expected path after install. Collection may not be properly installed."; exit 1; }
+
+          echo "ANSIBLE_COLLECTIONS_PATH=$COLLECTION_INSTALL_PATH" >> $GITHUB_ENV
+
+      - name: Generate Unique Prefix
+        id: generate-prefix  
+        run: |
+          UNIQUE_ID=$(uuidgen | cut -c1-8)
+          UNIQUE_PREFIX="${{ github.event.inputs.rancher_hostname_prefix }}-$UNIQUE_ID"
+          echo "Generated unique prefix: $UNIQUE_PREFIX"
+          echo "prefix=$UNIQUE_PREFIX" >> $GITHUB_OUTPUT
+
+      - name: Provision RKE2 HA Cluster Infrastructure with Tofu
+        id: provision-cluster
+        run: |
+          set -x
+
+          echo "Starting Tofu Provisioning Step..."
+          cd ${{ env.TF_MODULES_PATH }}/tofu/aws/
+          mkdir -p .tmp_cluster_config
+          cd .tmp_cluster_config
+          echo "Created Tofu working directory: $(pwd)"
+
+          echo "Generating SSH key pair from secret..."
+          mkdir -p keys
+          echo "$SSH_PRIVATE_KEY" > keys/id_rsa
+          chmod 600 keys/id_rsa
+          ssh-keygen -y -f keys/id_rsa > keys/id_rsa.pub
+          echo "Public key generated at keys/id_rsa.pub"
+          
+          echo "Generating Tofu main.tf and terraform.tfvars files..."
+          cat <<'EOF' > main.tf
+          data "aws_route53_zone" "selected" {
+            name = "qa.rancher.space."
+            private_zone = false
+          }
+
+          provider "aws" {
+            access_key = var.aws_access_key
+            secret_key = var.aws_secret_key
+            region     = var.aws_region
+          }
+
+          resource "aws_key_pair" "ssh_public_key" {
+            key_name   = "tf-key-${var.rancher_hostname_prefix}"
+            public_key = file("keys/id_rsa.pub")
+          }
+
+          resource "aws_instance" "node" {
+            for_each                    = toset(["master", "worker1", "worker2"])
+            ami                         = var.aws_ami
+            instance_type               = var.aws_instance_type
+            key_name                    = aws_key_pair.ssh_public_key.key_name
+            vpc_security_group_ids      = [var.aws_security_group]
+            subnet_id                   = var.aws_subnet
+            associate_public_ip_address = true
+
+            ebs_block_device {
+              device_name           = "/dev/sda1"
+              volume_size           = var.aws_volume_size
+              volume_type           = var.aws_volume_type
+              encrypted             = true
+              delete_on_termination = true
+            }
+
+            tags = {
+              Name = "tf-${var.rancher_hostname_prefix}-${each.key}"
+            }
+          }
+
+          resource "aws_lb" "aws_nlb" {
+            internal           = false
+            load_balancer_type = "network"
+            subnets            = [var.aws_subnet]
+            name               = "${var.rancher_hostname_prefix}-nlb"
+          }
+
+          resource "aws_lb_target_group" "rke2_tg" {
+            for_each = toset(["443", "80", "9345", "6443"])
+            name = "${var.rancher_hostname_prefix}-tg-${each.key}"
+            port = each.key
+            protocol    = "TCP"
+            vpc_id      = var.aws_vpc
+
+            health_check {
+              protocol            = "HTTP"
+              port                = "6443"
+              path                = "/ping"
+              interval            = 10
+              timeout             = 6
+              healthy_threshold   = 3
+              unhealthy_threshold = 3
+            }
+          }
+
+          resource "aws_lb_listener" "rke2_listener" {
+            for_each          = aws_lb_target_group.rke2_tg
+            load_balancer_arn = aws_lb.aws_nlb.arn
+            port              = each.value.port
+            protocol          = "TCP"
+            default_action {
+              type             = "forward"
+              target_group_arn = each.value.arn
+            }
+          }
+
+          resource "aws_lb_target_group_attachment" "rke2_tg_attachment" {
+            for_each = {
+              for pair in setproduct(keys(aws_instance.node), ["443", "80", "9345", "6443"]) :
+              "${pair[0]}-${pair[1]}" => {
+                instance_id = aws_instance.node[pair[0]].id
+                port = pair[1]
+              }
+            }
+            target_group_arn = aws_lb_target_group.rke2_tg[each.value.port].arn
+            target_id = each.value.instance_id
+            port = each.value.port
+          }
+
+          resource "aws_route53_record" "rancher_cname" {
+            zone_id = data.aws_route53_zone.selected.zone_id
+            name    = "${var.rancher_hostname_prefix}.qa.rancher.space"
+            type    = "CNAME"
+            ttl     = 300
+            records = [aws_lb.aws_nlb.dns_name]
+          }
+          
+          variable "rancher_hostname_prefix" { type = string }
+          variable "aws_region" { type = string }
+          variable "aws_access_key" { type = string }
+          variable "aws_secret_key" { type = string }
+          variable "aws_ami" { type = string }
+          variable "aws_instance_type" { type = string }
+          variable "aws_security_group" { type = string }
+          variable "aws_subnet" { type = string }
+          variable "aws_vpc" { type = string }
+          variable "aws_volume_size" { type = number }
+          variable "aws_volume_type" { type = string }
+
+          output "first_node_public_dns" {
+            value = aws_instance.node["master"].public_dns
+          }
+          output "first_node_private_ip" {
+            value = aws_instance.node["master"].private_ip
+          }
+          output "all_node_public_dns" {
+            value = [for node in aws_instance.node : node.public_dns]
+          }
+          output "all_instance_ids" {
+            value = [for node in aws_instance.node : node.id]
+          }
+          output "lb_dns_name" {
+            value = aws_lb.aws_nlb.dns_name
+          }
+          output "tf_state_dir" {
+            value = path.module
+          }
+          output "ssh_key_name" {
+            value = aws_key_pair.ssh_public_key.key_name
+          }
+          EOF
+          
+          echo "Writing terraform.tfvars file..."
+          echo "rancher_hostname_prefix=\"${{ steps.generate-prefix.outputs.prefix }}\"" > terraform.tfvars
+          echo "aws_region=\"$AWS_REGION\"" >> terraform.tfvars
+          echo "aws_access_key=\"$AWS_ACCESS_KEY_ID\"" >> terraform.tfvars
+          echo "aws_secret_key=\"$AWS_SECRET_ACCESS_KEY\"" >> terraform.tfvars
+          echo "aws_ami=\"$AWS_AMI\"" >> terraform.tfvars
+          echo "aws_instance_type=\"$AWS_INSTANCE_TYPE\"" >> terraform.tfvars
+          echo "aws_security_group=\"$AWS_SECURITY_GROUP\"" >> terraform.tfvars
+          echo "aws_subnet=\"$AWS_SUBNET\"" >> terraform.tfvars
+          echo "aws_vpc=\"$AWS_VPC\"" >> terraform.tfvars
+          echo "aws_volume_size=$AWS_VOLUME_SIZE" >> terraform.tfvars
+          echo "aws_volume_type=\"$AWS_VOLUME_TYPE\"" >> terraform.tfvars
+          
+          echo "Running tofu init..."
+          tofu init
+          
+          echo "Running tofu apply..."
+          tofu apply -var-file=terraform.tfvars -auto-approve
+          
+          echo "Tofu apply command completed. Refreshing state to get outputs..."
+          tofu refresh
+          
+          FIRST_NODE_PUBLIC_DNS=$(tofu output -raw first_node_public_dns || echo "")
+          FIRST_NODE_PRIVATE_IP=$(tofu output -raw first_node_private_ip || echo "")
+          IP_LIST=$(tofu output -json all_node_public_dns | jq -r 'join(",")')
+          EC2_INSTANCE_IDS=$(tofu output -json all_instance_ids | jq -r 'join(",")')
+          LB_DNS=$(tofu output -raw lb_dns_name || echo "")
+          
+          echo "IP_LIST=$IP_LIST" >> $GITHUB_ENV
+          echo "KUBE_API_HOST_MAIN_NODE=$FIRST_NODE_PUBLIC_DNS" >> $GITHUB_ENV
+          echo "FQDN_MAIN_NODE=$FIRST_NODE_PUBLIC_DNS" >> $GITHUB_ENV
+          echo "FIRST_NODE_PRIVATE_IP=$FIRST_NODE_PRIVATE_IP" >> $GITHUB_ENV
+          echo "EC2_INSTANCE_IDS=$EC2_INSTANCE_IDS" >> $GITHUB_ENV
+          echo "LB_DNS=$LB_DNS" >> $GITHUB_ENV
+          echo "fqdn-main-node=$FIRST_NODE_PUBLIC_DNS" >> $GITHUB_OUTPUT
+          echo "tf-state-dir=$(pwd)" >> $GITHUB_OUTPUT
+          echo "ssh-key-name=$(tofu output -raw ssh_key_name)" >> $GITHUB_OUTPUT
+          
+      - name: Setup Initial RKE2 Master Node with Ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: 'false'
+        run: |
+          cd .github/ansible/rke2-setup
+          cp ${{ steps.provision-cluster.outputs.tf-state-dir }}/keys/id_rsa rke2_ha.pem
+          chmod 600 rke2_ha.pem
+          cp ${{ steps.provision-cluster.outputs.tf-state-dir }}/terraform.tfstate .
+
+          FQDN_MAIN_NODE_VAR="${{ steps.provision-cluster.outputs.fqdn-main-node }}"
+
+          echo "[rke2_master]" > hosts.ini
+          echo "$FQDN_MAIN_NODE_VAR ansible_user=ubuntu ansible_ssh_private_key_file=rke2_ha.pem" >> hosts.ini
+          UNIQUE_PREFIX_VAR="${{ steps.generate-prefix.outputs.prefix }}"
+
+          ANSIBLE_VARS="kubernetes_version=${{ github.event.inputs.kubernetes_version }} unique_prefix=$UNIQUE_PREFIX_VAR rancher_hostname_prefix=$UNIQUE_PREFIX_VAR terraform_state_file=./terraform.tfstate kubeconfig_file=${{ env.KUBECONFIG }}"
+          ansible-playbook -i hosts.ini rke2-master-setup.yml --extra-vars "$ANSIBLE_VARS"
+
+      - name: Setup Joining RKE2 Master Nodes with Ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: 'false'
+        run: |
+          cd .github/ansible/rke2-setup
+          cp ${{ steps.provision-cluster.outputs.tf-state-dir }}/keys/id_rsa rke2_ha.pem
+          chmod 600 rke2_ha.pem
+          cp ${{ steps.provision-cluster.outputs.tf-state-dir }}/terraform.tfstate .
+          
+          UNIQUE_PREFIX_VAR="${{ steps.generate-prefix.outputs.prefix }}"
+          KUBE_API_HOST_VAR="${{ steps.provision-cluster.outputs.fqdn-main-node }}"
+          
+          IFS=',' read -ra ADDR <<< "$IP_LIST"
+          echo "[rke2_join]" > hosts.ini
+          for i in "${ADDR[@]:1}"; do
+            echo "$i ansible_user=ubuntu ansible_ssh_private_key_file=rke2_ha.pem" >> hosts.ini
+          done
+
+          ANSIBLE_VARS="unique_prefix=$UNIQUE_PREFIX_VAR rancher_hostname_prefix=$UNIQUE_PREFIX_VAR kube_api_host=$KUBE_API_HOST_VAR kubernetes_version=${{ github.event.inputs.kubernetes_version }} terraform_state_file=./terraform.tfstate"
+          ansible-playbook -i hosts.ini rke2-join-node-setup.yml --extra-vars "$ANSIBLE_VARS"
+
+      - name: Wait for all RKE2 nodes to be ready in the cluster
+        env:
+          KUBECONFIG: ${{ env.KUBECONFIG }}
+        run: |
+          ALL_NODES_READY=false
+          RETRIES=20
+          SLEEP_TIME=30
+
+          for i in $(seq 1 $RETRIES); do
+            echo "Attempt $i/$RETRIES: Checking node status with kubectl..."
+            READY_NODES=$(kubectl get nodes -o json | jq -r '[.items[] | select(.status.conditions[] | .type=="Ready" and .status=="True")] | length')
+            IFS=',' read -ra ALL_NODES_PUBLIC_IP <<< "$IP_LIST"
+            EXPECTED_NODES=${#ALL_NODES_PUBLIC_IP[@]}
+            echo "Expected nodes: $EXPECTED_NODES, Ready nodes: $READY_NODES"
+
+            if [ "$READY_NODES" -eq "$EXPECTED_NODES" ]; then
+              ALL_NODES_READY=true
+              echo "✅ All $EXPECTED_NODES RKE2 nodes are ready!"
+              echo "Final Cluster State:"
+              kubectl get nodes -o wide
+              break
+            else
+              echo "Still waiting for nodes to become ready. Retrying in $SLEEP_TIME seconds..."
+              sleep $SLEEP_TIME
+            fi
+          done
+
+          if [ "$ALL_NODES_READY" = false ]; then
+            echo "❌ Timeout: Not all RKE2 nodes became ready within the allotted time."
+            kubectl get nodes -o wide
+            exit 1
+          fi
+
+          echo "RKE2 HA Cluster setup complete."
+
+      - name: Strip 'v' from Rancher Chart Version
+        id: strip-version
+        run: |
+          STRIPPED_VERSION=$(echo "${{ github.event.inputs.rancher_chart_version }}" | sed 's/^v//')
+          echo "stripped-version=$STRIPPED_VERSION" >> $GITHUB_OUTPUT
+          echo "Stripped Rancher version for Helm: $STRIPPED_VERSION"
+
+      - name: Deploy Rancher on RKE2 HA cluster
+        id: deploy-rancher
+        run: |
+          cd .github/ansible/rancher
+          echo "$SSH_PRIVATE_KEY" > rancher_ha.pem
+          chmod 600 rancher_ha.pem
+          echo "$IP_LIST" | tr ',' '\n' > ha_nodes.txt
+          awk '{ print $0 " ansible_user=ubuntu ansible_ssh_private_key_file=rancher_ha.pem" }' ha_nodes.txt > inventory.ini
+          
+          ansible-playbook -i inventory.ini rancher-playbook.yml \
+            --extra-vars "rancher_version=${{ steps.strip-version.outputs.stripped-version }} \
+              bootstrap_password=${RANCHER_ADMIN_PASSWORD} \
+              kubeconfig_file=${{ env.KUBECONFIG }} \
+              cert_manager_version=${{ github.event.inputs.cert_manager_version }} \
+              fqdn=${{ steps.generate-prefix.outputs.prefix }}.qa.rancher.space \
+              rancher_image_tag=${{ github.event.inputs.rancher_image_tag }} \
+              rancher_helm_url=${{ github.event.inputs.rancher_helm_url }} \
+              rancher_helm_repo=${{ github.event.inputs.rancher_helm_repo }}" \
+            --extra-vars "rancher_helm_extra_values=${{ toJson(fromJson(github.event.inputs.rancher_helm_extra_settings)) }}"
+
+      - name: Set Rancher URL
+        id: set-rancher-url
+        run: |
+          RANCHER_FQDN_WITH_ID="${{ steps.generate-prefix.outputs.prefix }}.qa.rancher.space"
+          echo "RANCHER_FQDN=$RANCHER_FQDN_WITH_ID" >> $GITHUB_ENV
+          echo "RANCHER_URL=https://${RANCHER_FQDN_WITH_ID}" >> $GITHUB_ENV
+          echo "fqdn=$RANCHER_FQDN_WITH_ID" >> $GITHUB_OUTPUT
+          echo "url=https://${RANCHER_FQDN_WITH_ID}" >> $GITHUB_OUTPUT
+
+      - name: Fetch Rancher API key
+        id: rancher-token
+        run: |
+          RETRY_COUNT=0
+          MAX_RETRIES=20
+          SLEEP_TIME=20
+          RANCHER_URL="${{ steps.set-rancher-url.outputs.url }}"
+
+          echo "Attempting to log in to Rancher to get a Bearer token..."
+          
+          LOGIN_TOKEN=""
+          while [ -z "$LOGIN_TOKEN" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if [ $RETRY_COUNT -gt 0 ]; then
+              echo "Login failed. Retrying in $SLEEP_TIME seconds... (Attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)"
+              sleep $SLEEP_TIME
+            fi
+
+            login_payload='{"username":"admin","password":"'"${RANCHER_ADMIN_PASSWORD}"'"}'
+            token_response=$(curl -sk -X POST \
+              "${RANCHER_URL}/v3-public/localProviders/local?action=login" \
+              -H 'Content-Type: application/json' \
+              --data "$login_payload")
+            
+            if echo "$token_response" | jq -e '.token' >/dev/null; then
+                LOGIN_TOKEN=$(echo "$token_response" | jq -r .token)
+                echo "Successfully fetched Bearer token."
+                break
+            else
+                echo "Rancher API not yet ready or returned invalid response."
+                echo "Response received: $token_response"
+                RETRY_COUNT=$((RETRY_COUNT+1))
+            fi
+          done
+
+          if [ -z "$LOGIN_TOKEN" ]; then
+            echo "❌ Failed to fetch Bearer token after $MAX_RETRIES retries."
+            exit 1
+          fi
+
+          echo "Attempting to create a new API key with the Bearer token..."
+          API_ACCESS_KEY=""
+          API_SECRET_KEY=""
+          RETRY_COUNT=0
+          MAX_RETRIES=10
+          SLEEP_TIME=10
+
+          while [ -z "$API_ACCESS_KEY" ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if [ $RETRY_COUNT -gt 0 ]; then
+              echo "API key creation failed. Retrying in $SLEEP_TIME seconds... (Attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)"
+              sleep $SLEEP_TIME
+            fi
+
+            API_KEY_RESPONSE=$(curl -sk -X POST "${RANCHER_URL}/v3/tokens" \
+              -H "Authorization: Bearer $LOGIN_TOKEN" \
+              -H 'Content-Type: application/json' \
+              --data '{"type":"token","description":"gha-tofu"}')
+
+            API_ACCESS_KEY=$(echo "$API_KEY_RESPONSE" | jq -r '.accessKey')
+            API_SECRET_KEY=$(echo "$API_KEY_RESPONSE" | jq -r '.secretKey')
+            API_KEY=$(echo "$API_KEY_RESPONSE" | jq -r '.token')
+
+            if [ -z "$API_KEY" ]; then
+              echo "Failed to extract access/secret key from response. Response: $API_KEY_RESPONSE"
+            else
+              echo "Successfully created and fetched new API key."
+              break
+            fi
+            RETRY_COUNT=$((RETRY_COUNT+1))
+          done
+
+          if [ -z "$API_KEY" ]; then
+            echo "❌ Failed to create a new API key after $MAX_RETRIES retries."
+            exit 1
+          fi
+
+          echo "api-access-key=$API_ACCESS_KEY" >> $GITHUB_OUTPUT
+          echo "api-secret-key=$API_SECRET_KEY" >> $GITHUB_OUTPUT
+          echo "api-key=$API_KEY" >> $GITHUB_OUTPUT
+          echo "token=$LOGIN_TOKEN" >> $GITHUB_OUTPUT
+
+      - name: Tofu Provisioning of the Downstream Cluster
+        id: provision-ds-cluster
+        run: |
+          set -e
+          echo "Starting Tofu Provisioning step for downstream RKE2 node-driver cluster..."
+          mkdir -p .tmp_node_driver_cluster_config
+          cd .tmp_node_driver_cluster_config
+          echo "Created Tofu working directory for downstream node-driver cluster: $(pwd)"
+          
+          echo "Generating SSH key pair..."
+          ssh-keygen -t rsa -b 2048 -f id_rsa -N ""
+          SSH_PUBLIC_KEY_CONTENT=$(cat id_rsa.pub)
+          
+          cat <<'EOF' > main.tf
+          terraform {
+            required_providers {
+              rancher2 = {
+                source  = "rancher/rancher2"
+                version = "${{ github.event.inputs.rancher_terraform_provider_version }}"
+              }
+              aws = {
+                source = "hashicorp/aws"
+                version = "~> 5.0"
+              }
+            }
+          }
+          
+          provider "rancher2" {
+            api_url = var.rancher_api_url
+            token_key = var.rancher_admin_bearer_token
+            insecure = true
+          }
+          
+          provider "aws" {
+            region = var.aws_region
+          }
+          
+          # Create AWS cloud credential          
+          resource "rancher2_cloud_credential" "cloud_credential" {
+            name = var.cloud_credential_name
+            amazonec2_credential_config {
+              access_key = "${{ secrets.AWS_ACCESS_KEY_ID }}"
+              secret_key = "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+              default_region = var.aws_region
+            }
+          }
+          
+          # Create machine configuration for RKE2/K3S cluster
+          resource "rancher2_machine_config_v2" "machine_config" {
+            generate_name = var.machine_config_name
+            amazonec2_config {
+              ami                   = var.aws_ami
+              region                = var.aws_region
+              security_group        = [var.aws_security_group_name]
+              subnet_id             = var.aws_subnet_id
+              vpc_id                = var.aws_vpc_id
+              zone                  = var.aws_zone_letter
+              instance_type         = var.aws_instance_type
+              root_size             = var.aws_volume_size
+              ssh_key_contents      = var.ssh_key_contents
+              ssh_user              = var.ssh_user
+              iam_instance_profile  = var.aws_iam_instance_profile
+            }
+          }
+
+          # Create RKE2/K3S downstream cluster w/appropriate node pool
+          resource "rancher2_cluster_v2" "rke2_downstream_cluster" { 
+            name                                      = var.cluster_name
+            kubernetes_version                        = var.kubernetes_version
+            enable_network_policy                     = var.enable_network_policy
+            default_cluster_role_for_project_members  = var.default_cluster_role_for_project_members
+            default_pod_security_admission_configuration_template_name = var.default_pod_security_admission_configuration_template_name
+            rke_config {
+              machine_pools {
+                name                                  = var.machine_pool_node1_name
+                cloud_credential_secret_name          = rancher2_cloud_credential.cloud_credential.id
+                control_plane_role                    = true
+                etcd_role                             = true
+                worker_role                           = true    
+                quantity                              = var.node1_quantity
+                machine_config {
+                  kind = rancher2_machine_config_v2.machine_config.kind
+                  name = rancher2_machine_config_v2.machine_config.name
+                }
+                rolling_update {
+                  max_surge       = 3
+                  max_unavailable = 3
+                }
+              }
+              machine_pools {
+                name                                  = var.machine_pool_node2_name
+                cloud_credential_secret_name          = rancher2_cloud_credential.cloud_credential.id
+                control_plane_role                    = true
+                etcd_role                             = true
+                worker_role                           = true
+                quantity                              = var.node2_quantity
+                machine_config {
+                  kind = rancher2_machine_config_v2.machine_config.kind
+                  name = rancher2_machine_config_v2.machine_config.name
+                }
+                rolling_update {
+                  max_surge       = 3
+                  max_unavailable = 3
+                }
+              }
+              machine_pools {
+                name                                  = var.machine_pool_node3_name
+                cloud_credential_secret_name          = rancher2_cloud_credential.cloud_credential.id
+                control_plane_role                    = false
+                etcd_role                             = true
+                worker_role                           = false
+                quantity                              = var.node3_quantity
+                machine_config {
+                  kind = rancher2_machine_config_v2.machine_config.kind
+                  name = rancher2_machine_config_v2.machine_config.name
+                }
+                rolling_update {
+                  max_surge       = 3
+                  max_unavailable = 3
+                }
+              }
+            }
+          }
+          
+          # Define variables used in the HCL file
+          variable "cluster_name" { type = string }
+          variable "kubernetes_version" { type = string }
+          variable "enable_network_policy" { type = bool }
+          variable "default_cluster_role_for_project_members" { type = string }
+          variable "default_pod_security_admission_configuration_template_name" { type = string }
+
+          variable "cloud_credential_name" { type = string }
+          variable "machine_config_name" { type = string }
+
+          # AWS Config for Machine Config
+          variable "aws_access_key" { type = string }
+          variable "aws_secret_key" { type = string }
+          variable "aws_region" { type = string }
+          variable "aws_ami" { type = string }
+          variable "aws_instance_type" { type = string }
+          variable "aws_subnet_id" { type = string }
+          variable "aws_security_group_name" { type = string }
+          variable "aws_volume_size" { type = number }
+          variable "aws_vpc_id" { type = string }
+          variable "aws_zone_letter" { type = string }
+          variable "aws_iam_instance_profile" { type = string }
+          variable "ssh_key_contents" { type = string }
+          variable "ssh_user" { type = string }
+
+          # Machine Pool specific variables (UPDATED THESE)
+          variable "machine_pool_node1_name" { type = string }
+          variable "machine_pool_node2_name" { type = string } 
+          variable "machine_pool_node3_name" { type = string }
+          variable "node1_quantity" { type = number }
+          variable "node2_quantity" { type = number }
+          variable "node3_quantity" { type = number }
+
+          # Rancher API variables
+          variable "rancher_api_url" { type = string }
+          variable "rancher_admin_bearer_token" { type = string }
+
+          # Define outputs to be used by later steps in the workflow.
+          output "cluster_name" {
+            value = rancher2_cluster_v2.rke2_downstream_cluster.name
+          }
+          output "tf_state_dir_nd" { value = path.module }
+          EOF
+          
+          echo "Writing terraform.tfvars file..."
+          echo "cluster_name=\"${{ steps.generate-prefix.outputs.prefix }}-downstream-rke2-cluster\"" > terraform.tfvars
+          echo "kubernetes_version=\"${{ github.event.inputs.kubernetes_version }}\"" >> terraform.tfvars
+          echo "enable_network_policy=false" >> terraform.tfvars
+          echo "default_cluster_role_for_project_members=\"cluster-member\"" >> terraform.tfvars
+          echo "default_pod_security_admission_configuration_template_name=\"\"" >> terraform.tfvars # Default empty
+
+          echo "cloud_credential_name=\"${{ steps.generate-prefix.outputs.prefix }}-aws-cred\"" >> terraform.tfvars
+          echo "machine_config_name=\"${{ steps.generate-prefix.outputs.prefix }}-ndp\"" >> terraform.tfvars
+
+          echo "aws_access_key=\"$AWS_ACCESS_KEY_ID\"" >> terraform.tfvars
+          echo "aws_secret_key=\"$AWS_SECRET_ACCESS_KEY\"" >> terraform.tfvars
+          echo "aws_region=\"$AWS_REGION\"" >> terraform.tfvars
+          echo "aws_ami=\"$AWS_AMI\"" >> terraform.tfvars
+          echo "aws_instance_type=\"$AWS_INSTANCE_TYPE\"" >> terraform.tfvars
+          echo "aws_subnet_id=\"$AWS_SUBNET\"" >> terraform.tfvars
+          echo "aws_security_group_name=\"$AWS_SECURITY_GROUP\"" >> terraform.tfvars
+          echo "aws_volume_size=$AWS_VOLUME_SIZE" >> terraform.tfvars
+          echo "aws_vpc_id=\"$AWS_VPC\"" >> terraform.tfvars
+          echo "aws_zone_letter=\"$AWS_AVAILABILITY_ZONE\"" >> terraform.tfvars
+          echo "aws_iam_instance_profile=\"$AWS_IAM_INSTANCE_PROFILE\"" >> terraform.tfvars
+          echo "ssh_key_contents=\"$SSH_PUBLIC_KEY_CONTENT\"" >> terraform.tfvars
+          echo "ssh_user=\"ubuntu\"" >> terraform.tfvars
+
+          echo "machine_pool_node1_name=\"node1-pool\"" >> terraform.tfvars
+          echo "machine_pool_node2_name=\"node2-pool\"" >> terraform.tfvars
+          echo "machine_pool_node3_name=\"node3-pool\"" >> terraform.tfvars
+          echo "node1_quantity=1" >> terraform.tfvars
+          echo "node2_quantity=1" >> terraform.tfvars
+          echo "node3_quantity=1" >> terraform.tfvars
+
+          echo "rancher_api_url=\"${{ steps.set-rancher-url.outputs.url }}/v3\"" >> terraform.tfvars
+          echo "rancher_admin_bearer_token=\"${{ steps.rancher-token.outputs.api-key }}\"" >> terraform.tfvars
+          
+          echo "Running tofu init..."
+          tofu init
+          
+          echo "Running tofu apply..."
+          tofu apply -var-file=terraform.tfvars -auto-approve
+          
+          echo "Tofu apply command completed. Refreshing state to get outputs..."
+          tofu refresh
+          
+          CLUSTER_NAME=$(tofu output -raw cluster_name)
+          TF_STATE_DIR_ND=$(tofu output -raw tf_state_dir_nd)
+
+          echo "downstream-cluster-name=$CLUSTER_NAME" >> $GITHUB_ENV
+          echo "tf-state-dir-nd=$TF_STATE_DIR_ND" >> $GITHUB_OUTPUT
+
+      - name: Wait for downstream cluster to be ready
+        env:
+          RANCHER_URL: ${{ steps.set-rancher-url.outputs.url }}
+          API_KEY: ${{ steps.rancher-token.outputs.api-key }}
+          DOWNSTREAM_CLUSTER_NAME: ${{ steps.provision-ds-cluster.outputs.downstream-cluster-name }}
+        run: |
+          set -e
+          RETRY_COUNT=0
+          MAX_RETRIES=40
+          SLEEP_TIME=30
+          echo "Waiting for the downstream cluster '${{ env.DOWNSTREAM_CLUSTER_NAME }}' to be active..."
+
+          while [ "$RETRY_COUNT" -lt "$MAX_RETRIES" ]; do
+            echo "Attempt $((RETRY_COUNT + 1))/$MAX_RETRIES..."
+            set +e
+            CLUSTER_STATE=$(curl -sk -H "Authorization: Bearer ${{ env.API_KEY }}" \
+              "${{ env.RANCHER_URL }}/v1/management.cattle.io.clusters" \
+              | jq -r '.data[] | select(.name=="${{ env.DOWNSTREAM_CLUSTER_NAME }}") | .state')
+            JQ_EXIT_CODE=$?
+            set -e
+
+            if [ "$CLUSTER_STATE" == "active" ] && [ $JQ_EXIT_CODE -eq 0 ]; then
+              echo "✅ Downstream cluster '${{ env.DOWNSTREAM_CLUSTER_NAME }}' is now active!"
+              exit 0
+            else
+              echo "Cluster state is '${CLUSTER_STATE}'. Retrying in $SLEEP_TIME seconds..."
+              sleep $SLEEP_TIME
+              RETRY_COUNT=$((RETRY_COUNT+1))
+            fi
+          done
+
+          echo "❌ Timeout: Downstream cluster did not become active within the allotted time."
+          exit 1
+      
+      - name: Save Tofu State Files
+        if: success() || failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tofu-state-files
+          path: |
+            ${{ steps.provision-cluster.outputs.tf-state-dir-main }}
+            ${{ steps.provision-ds-cluster.outputs.tf-state-dir-nd }}
+          
+  cleanup:
+    runs-on: ubuntu-latest
+    name: Destroy Tofu Resources
+    needs: provision
+    if: always()
+
+    steps:
+      - name: Download Tofu state files
+        uses: actions/download-artifact@v4
+        with:
+          name: tofu-state-files
+          path: tofu-state-files
+
+      - name: Install dependencies (Tofu)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip jq
+          
+          TOFU_VERSION=$(curl -s https://api.github.com/repos/opentofu/opentofu/releases/latest | jq -r '.tag_name')
+          TOFU_VER_CLEAN=${TOFU_VERSION#v}
+          wget -q https://github.com/opentofu/opentofu/releases/download/${TOFU_VERSION}/tofu_${TOFU_VER_CLEAN}_linux_amd64.tar.gz
+          tar -xzf tofu_${TOFU_VER_CLEAN}_linux_amd64.tar.gz
+          sudo mv tofu /usr/local/bin/
+          sudo ln -s /usr/local/bin/tofu /usr/local/bin/terraform
+      
+      - name: Destroy Downstream RKE2 Node Infrastructure
+        run: |
+          cd tofu-state-files/tmp*/downstream_node_tofu
+          echo "Destroying downstream RKE2 node infrastructure with Tofu..."
+          tofu destroy -auto-approve
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+
+      - name: Destroy Rancher Registration Resources
+        run: |
+          cd tofu-state-files/tmp*/rancher_custom_cluster_tofu
+          echo "Destroying Rancher registration resources with Tofu..."
+          tofu destroy -auto-approve
+        env:
+          RANCHER_URL: https://${{ needs.provision.outputs.fqdn-main-node }}
+          

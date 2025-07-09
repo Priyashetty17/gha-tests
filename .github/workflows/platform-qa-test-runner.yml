@@ -1,0 +1,257 @@
+name: Platform QA Test Runner with Qase Reporting
+run-name: "PlatformQA - ${{ github.event.inputs.rancher_host }} - ${{ github.event.inputs.test_package }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      rancher_host:
+        description: "Rancher host (e.g. mycluster.qa.rancher.space)"
+        required: true
+      cluster_name:
+        description: "Downstream cluster name"
+        required: true
+      test_package:
+        description: "Single test package path (e.g. validation/rbac)"
+        required: true
+      run_all_tests:
+        description: "Run all test files in the package?"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      test_selector:
+        description: "Test suite or test name regex (e.g. ^TestSuiteName$ or ^TestSuite/TestCase$), if run_all_tests=false"
+        required: false
+      exclude_test_files:
+        description: "Test files to exclude (comma-separated), if run_all_tests=true (e.g. rbac_test.go,projects_test.go)"
+        required: false
+      report_to_qase:
+        description: "Enable Qase reporting"
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+      qase_test_run_id:
+        description: "Qase Test Run ID, if report_to_qase=true"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  QUAY_REGISTRY_NAME: ${{ secrets.QUAY_REGISTRY_NAME }}
+  QUAY_REGISTRY_USERNAME: ${{ secrets.QUAY_REGISTRY_USERNAME }}
+  QUAY_REGISTRY_PASSWORD: ${{ secrets.QUAY_REGISTRY_PASSWORD }}
+  AWS_ACCESS_KEY: ${{ secrets.PQA_AWS_ACCESS_KEY }}
+  AWS_SECRET_KEY: ${{ secrets.PQA_AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  RANCHER_ADMIN_PASSWORD: ${{ secrets.PQA_RANCHER_ADMIN_PASSWORD }}
+  AWS_IAM_PROFILE: ${{ secrets.AWS_IAM_PROFILE }}
+  AWS_AMI: ${{ secrets.AWS_AMI }}
+  AWS_USER: ${{ secrets.AWS_USER }}
+  AWS_VPC_ID: ${{ secrets.PQA_AWS_VPC_ID }}
+  AWS_SUBNET_ID: ${{ secrets.PQA_AWS_SUBNET_ID }}
+  AWS_SECURITY_GROUP_NAMES: ${{ secrets.PQA_AWS_SECURITY_GROUP_NAMES }}
+  AWS_SECURITY_GROUPS: ${{ secrets.PQA_AWS_SECURITY_GROUPS }}
+  PROVIDER_AMAZON: ${{ vars.PROVIDER_AMAZON }}
+  CNI: ${{ secrets.CNI }}
+  AWS_INSTANCE_TYPE: ${{ vars.AWS_INSTANCE_TYPE }}
+  AWS_VOLUME_TYPE: ${{ vars.AWS_VOLUME_TYPE }}
+  AWS_ZONE_LETTER: ${{ vars.AWS_ZONE_LETTER }}
+  AWS_ROOT_SIZE: ${{ vars.AWS_ROOT_SIZE }}
+  SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+  SSH_PRIVATE_KEY_NAME: ${{ secrets.SSH_PRIVATE_KEY_NAME }}
+  QASE_AUTOMATION_TOKEN: ${{ secrets.QASE_AUTOMATION_TOKEN }}
+  OPENLDAP_HOSTNAME: ${{ secrets.OPENLDAP_HOSTNAME }}
+  OPENLDAP_ADMIN_USERNAME: ${{ secrets.OPENLDAP_ADMIN_USERNAME }}
+  OPENLDAP_ADMIN_PASSWORD: ${{ secrets.OPENLDAP_ADMIN_PASSWORD }}
+  OPENLDAP_USER_PASSWORD: ${{ secrets.OPENLDAP_USER_PASSWORD }}
+  OPENLDAP_SA_PASSWORD: ${{ secrets.OPENLDAP_SA_PASSWORD }}
+  OPENLDAP_SA_DN_NAME: ${{ vars.OPENLDAP_SA_DN_NAME }}
+  OPENLDAP_USERS_SEARCHBASE: ${{ vars.OPENLDAP_USERS_SEARCHBASE }}
+  OPENLDAP_GROUPS_SEARCHBASE: ${{ vars.OPENLDAP_GROUPS_SEARCHBASE }}
+  NETWORK_STACK_PREFERENCE: ${{ vars.PQA_NETWORK_STACK_PREFERENCE }}
+
+jobs:
+  run-tests:
+    runs-on: ubuntu-latest
+    env:
+      RANCHER_HOST: ${{ github.event.inputs.rancher_host }}
+      CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}
+      TEST_PACKAGE: ${{ github.event.inputs.test_package }}
+      RUN_ALL_TESTS: ${{ github.event.inputs.run_all_tests }}
+      EXCLUDE_TEST_FILES: ${{ github.event.inputs.exclude_test_files }}
+      TEST_SELECTOR: ${{ github.event.inputs.test_selector }}
+      REPORT_TO_QASE: ${{ github.event.inputs.report_to_qase }}
+      QASE_TEST_RUN_ID: ${{ github.event.inputs.qase_test_run_id }}
+      GOTESTSUM_OUTPUT_BUFFER: 0
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          submodules: recursive
+
+      - name: Set up Go 
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: "./go.mod"
+          cache-dependency-path: "**/*.sum"
+
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
+      - name: Create SSH key file
+        shell: bash
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/$SSH_PRIVATE_KEY_NAME.pem
+          chmod 600 ~/.ssh/$SSH_PRIVATE_KEY_NAME.pem
+          echo "SSH_PRIVATE_KEY_PATH=$HOME/.ssh" >> $GITHUB_ENV
+
+      - name: Get Rancher admin token
+        run: bash .github/scripts/platform-qa-get-rancher-token.sh
+
+      - name: Get Rancher version
+        run: bash .github/scripts/platform-qa-get-rancher-version.sh
+
+      - name: Get supported Kubernetes version
+        run: bash .github/scripts/platform-qa-get-k8s-version.sh
+
+      - name: Preprocess variables and set environment
+        id: set-env
+        shell: bash
+        run: |
+          CLEAN_VERSION="${K8S_VERSION#v}"
+
+          echo "RKE2_VERSION=v${CLEAN_VERSION}+rke2r1" >> $GITHUB_ENV
+          echo "K3S_VERSION=v${CLEAN_VERSION}+k3s1" >> $GITHUB_ENV
+          echo "KUBERNETES_VERSION=v${CLEAN_VERSION}+k3s1" >> $GITHUB_ENV
+
+          export AWS_SECURITY_GROUP_NAMES=$(echo "$AWS_SECURITY_GROUP_NAMES" | sed 's/,/","/g')
+          export AWS_SECURITY_GROUPS=$(echo "$AWS_SECURITY_GROUPS" | sed 's/,/","/g')
+          echo "AWS_SECURITY_GROUP_NAMES=$AWS_SECURITY_GROUP_NAMES" >> $GITHUB_ENV
+          echo "AWS_SECURITY_GROUPS=$AWS_SECURITY_GROUPS" >> $GITHUB_ENV
+
+      - name: Create cattle config
+        run: bash .github/scripts/platform-qa-create-cattle-config.sh
+
+      - name: Run all tests in package
+        if: ${{ github.event.inputs.run_all_tests == 'true' }}
+        env:
+          CATTLE_TEST_CONFIG: ${{ github.workspace }}/cattle-config.yaml
+        run: |
+          REPO_ROOT="${GITHUB_WORKSPACE}"
+          PACKAGE="$TEST_PACKAGE"
+          TAGS="validation"
+
+          if [ ! -d "$PACKAGE" ]; then
+            echo "❌ Package $PACKAGE not found. Exiting."
+            exit 1
+          fi
+
+          echo "🔎 Package: $PACKAGE"
+          cd "$REPO_ROOT/$PACKAGE"
+
+          ALL_TEST_FILES=$(ls *_test.go 2>/dev/null | grep -E -v '(^_deprecated_|^deprecated_)' || true)
+
+          FILTERED_TEST_FILES=""
+          for file in $ALL_TEST_FILES; do
+            if grep -q "\!$RANCHER_SHORT_VERSION" "$file"; then
+              echo "Skipping $file (excluded for version $RANCHER_SHORT_VERSION)"
+              continue
+            fi
+            FILTERED_TEST_FILES="$FILTERED_TEST_FILES $file"
+          done
+
+          if [ -n "$EXCLUDE_TEST_FILES" ]; then
+            EXCLUDE_PATTERN_FILE=$(mktemp)
+            echo "$EXCLUDE_TEST_FILES" | tr ',' '\n' > "$EXCLUDE_PATTERN_FILE"
+            FILTERED_TEST_FILES=$(echo "$FILTERED_TEST_FILES" | tr ' ' '\n' | grep -x -v -f "$EXCLUDE_PATTERN_FILE" | tr '\n' ' ' || true)
+            rm "$EXCLUDE_PATTERN_FILE"
+          fi
+
+          FILTERED_TEST_FILES=$(echo "$FILTERED_TEST_FILES" | xargs)
+
+          if [ -z "$FILTERED_TEST_FILES" ]; then
+            echo "⚠️ No test files found after applying filters. Exiting."
+            exit 0
+          fi
+
+          NON_TEST_GO_FILES=$(ls *.go 2>/dev/null | grep -v '_test.go' || true)
+          FILES_TO_COMPILE_AND_RUN="$FILTERED_TEST_FILES $NON_TEST_GO_FILES"
+
+          echo "$(date +'%T') — 🚀 Running tests in package $PACKAGE"
+          echo "   Test Files: $FILTERED_TEST_FILES"
+          echo "   With tags: $TAGS"
+          set +e
+          stdbuf -oL gotestsum \
+            --format=standard-verbose \
+            --junitfile "$GITHUB_WORKSPACE/results-${PACKAGE//\//-}.xml" \
+            --jsonfile "$GITHUB_WORKSPACE/results-${PACKAGE//\//-}.json" \
+            -- -v -tags="$TAGS" -timeout 6h $FILES_TO_COMPILE_AND_RUN 
+
+          TEST_EXIT_CODE=$?
+          echo "TEST_EXIT_CODE=$TEST_EXIT_CODE" >> $GITHUB_ENV
+          set -e
+          echo "✅ Finished executing tests for package $PACKAGE on cluster $RANCHER_HOST"
+          echo "   Results: $GITHUB_WORKSPACE/results-${PACKAGE//\//-}.json"
+          
+      - name: Run single test with selector
+        if: ${{ github.event.inputs.run_all_tests == 'false' }}
+        env:
+          CATTLE_TEST_CONFIG: ${{ github.workspace }}/cattle-config.yaml
+        run: |
+          REPO_ROOT="${GITHUB_WORKSPACE}"
+          PACKAGE="$TEST_PACKAGE"
+          TAGS="validation"
+          
+          if [ -z "$TEST_SELECTOR" ]; then
+            echo "❌ test_selector input is required when run_all_tests is false"
+            exit 1
+          fi
+          
+          echo "▶ Running selector: '$TEST_SELECTOR' with tags: $TAGS for package: $PACKAGE"
+          set +e
+          stdbuf -oL gotestsum \
+            --format=standard-verbose \
+            --junitfile "$GITHUB_WORKSPACE/results-${PACKAGE//\//-}.xml" \
+            --jsonfile "$GITHUB_WORKSPACE/results-${PACKAGE//\//-}.json" \
+            --packages="github.com/rancher/tests/$PACKAGE" \
+            -- -v -tags="$TAGS" -timeout 6h -run "$TEST_SELECTOR" 
+
+          TEST_EXIT_CODE=$?
+          echo "TEST_EXIT_CODE=$TEST_EXIT_CODE" >> $GITHUB_ENV
+          set -e
+
+          echo "✅ Finished executing tests for package $PACKAGE on cluster $RANCHER_HOST"
+          echo "   Results: $GITHUB_WORKSPACE/results-${PACKAGE//\//-}.json"
+          
+      - name: Report results to Qase
+        if: ${{ github.event.inputs.report_to_qase == 'true' }}
+        run: |
+          PACKAGE="$TEST_PACKAGE"
+          if [ -z "$QASE_TEST_RUN_ID" ]; then
+            echo "⚠️ QASE reporting requested but no test run ID provided. Skipping reporting."
+            exit 0
+          fi
+          
+          bash "$GITHUB_WORKSPACE/.github/scripts/platform-qa-report-to-qase.sh" \
+            "$GITHUB_WORKSPACE/results-${PACKAGE//\//-}.json" \
+            "$PACKAGE" \
+            "$QASE_TEST_RUN_ID" \
+            "$QASE_AUTOMATION_TOKEN"
+
+      - name: Fail workflow if any test failed
+        run: |
+          TEST_EXIT_CODE=${TEST_EXIT_CODE:-0}
+          if [ "${TEST_EXIT_CODE}" != "0" ]; then
+            echo "❌ One or more tests failed in package $TEST_PACKAGE"
+            exit 1
+          fi
+
+      - name: Remove SSH key
+        if: always()
+        run: |
+          echo "Removing SSH private key..."
+          rm -f ~/.ssh/$SSH_PRIVATE_KEY_NAME.pem

@@ -1,0 +1,12 @@
+plugin: cloud.terraform.terraform_provider
+project_path: "{{ lookup('env', 'TERRAFORM_NODE_SOURCE') }}"
+workspace: "{{ lookup('env', 'TF_WORKSPACE') }}"
+binary_path: tofu
+keyed_groups:
+  - key: tags.Name
+    prefix: ''
+all:
+  vars:
+    ansible_user: ubuntu
+    ansible_ssh_private_key_file: rke2_ha.pem
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"

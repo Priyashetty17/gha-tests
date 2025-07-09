@@ -1,0 +1,94 @@
+---
+- name: Wait for SSH to be available on all nodes
+  hosts: rke2_join
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH on each node
+      ansible.builtin.wait_for:
+        port: 22
+        host: "{{ inventory_hostname }}"
+        timeout: 300
+        state: started
+      delegate_to: localhost
+      run_once: true
+
+- name: Setup RKE2 Join Nodes
+  hosts: rke2_join
+  become: yes
+  gather_facts: false
+  vars:
+    # These variables are passed directly from the GitHub Actions workflow.
+    terraform_state_file: "{{ terraform_state_file }}"
+    rancher_hostname_prefix: "{{ rancher_hostname_prefix }}"
+    
+    # Use the correct Tofu output to get the master node's DNS name
+    # The `tf_binary` is set to 'tofu' to ensure the correct executable is used.
+    kube_api_host: "{{ lookup('cloud.terraform.tf_output', 'first_node_public_dns', state_file=terraform_state_file, tf_binary='tofu') }}"
+    node_token_file: "/tmp/node_token.txt"
+
+  tasks:
+    - name: Read node_token from local file and set as a fact
+      ansible.builtin.set_fact:
+        node_token: "{{ lookup('ansible.builtin.file', node_token_file) | trim }}"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Robust installation to avoid Docker Hub rate limits
+      block:
+        - name: Download RKE2 image tarball
+          ansible.builtin.get_url:
+            url: "https://github.com/rancher/rke2/releases/download/{{ kubernetes_version }}/rke2-images.linux-amd64.tar.gz"
+            dest: "/tmp/rke2-images.linux-amd64.tar.gz"
+            mode: '0644'
+
+        - name: Install RKE2 using local images
+          ansible.builtin.shell: |
+            curl -sfL https://get.rke2.io | INSTALL_RKE2_VERSION={{ kubernetes_version }} INSTALL_RKE2_TYPE="agent" INSTALL_RKE2_SKIP_DOWNLOAD=true sh -
+          args:
+            creates: /usr/local/bin/rke2
+          environment:
+            RKE2_INSTALL_IMAGE: "/tmp/rke2-images.linux-amd64.tar.gz"
+
+        - name: Clean up RKE2 image tarball
+          ansible.builtin.file:
+            path: /tmp/rke2-images.linux-amd64.tar.gz
+            state: absent
+
+    - name: Explicitly configure agent with token and server URL
+      block:
+        - name: Create config directory
+          ansible.builtin.file:
+            path: /etc/rancher/rke2
+            state: directory
+            owner: root
+            group: root
+            mode: '0755'
+
+        - name: Write config.yaml file
+          ansible.builtin.copy:
+            content: |
+              server: https://{{ kube_api_host }}:9345
+              token: "{{ node_token }}"
+            dest: /etc/rancher/rke2/config.yaml
+            owner: root
+            group: root
+            mode: '0600'
+        
+    - name: Reload systemd to recognize new RKE2 agent service file
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Start RKE2 agent service and wait for it to be ready
+      ansible.builtin.systemd:
+        name: rke2-agent
+        state: started
+        enabled: yes
+      register: service_start_result
+      retries: 10
+      delay: 10
+      until: service_start_result is succeeded or 'not found' not in service_start_result.msg
+
+    - name: Wait for the RKE2 agent to create its kubeconfig
+      ansible.builtin.wait_for:
+        path: /var/lib/rancher/rke2/agent/kubelet.kubeconfig
+        timeout: 300
