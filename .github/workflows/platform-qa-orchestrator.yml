@@ -1,0 +1,61 @@
+name: Platform QA Scheduled Run Orchestrator
+
+on:
+  schedule:
+    - cron: "0 10 * * *" # Runs every day at 10 AM UTC
+
+jobs:
+  provision-and-trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get Kubernetes version for Rancher
+        uses: ./.github/actions/get-k8s-version
+        id: k8s_version
+        with:
+          rancher_version: "2.12" # Replace with dynamic value if available
+
+      - name: Deploy Rancher
+        id: deploy-rancher
+        run: |
+          # Your provisioning script or action goes here
+          # For example, using a custom script that creates the env and returns info
+          echo "Simulating environment creation..."
+          echo "rancher_host=mycluster.qa.rancher.space" >> $GITHUB_OUTPUT
+          echo "admin_token=ghp_exampletoken123" >> $GITHUB_OUTPUT
+
+      - name: Provision downstream cluster
+        id: provision-downstream
+        run: |
+            echo "Simulating environment creation..."
+            echo "cluster_name=downstream-cluster" >> $GITHUB_OUTPUT
+
+      - name: Create Qase Test Run
+        id: create_qase_test_run
+        run: |
+          # Your script to create a Qase test run goes here
+          echo "Simulating Qase test run creation..."
+          echo "qase_test_run_id=12345" >> $GITHUB_OUTPUT
+
+      - name: Call package dispatcher workflow
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "platform-qa-package-dispatcher.yml",
+              ref: "main",
+              inputs: {
+                rancher_hosts: "${{ steps.deploy-rancher.outputs.rancher_host }}",
+                admin_tokens: "${{ steps.deploy-rancher.outputs.admin_token }}",
+                kubernetes_versions: "${{ steps.k8s_version.outputs.kubernetes_version }}",
+                cluster_names: "${{ steps.provision-downstream.outputs.cluster_name }}",
+                test_packages: "validation/rbac,validation/projects,validation/auth",
+                run_all_tests: "true",
+                recursive_tests: "true",
+                qase_test_run_ids: "${{ steps.create_qase_test_run.outputs.qase_test_run_id }}",
+                test_selector: "",
+                exclude_test_files: "openldap_test.go"
+              }
+            });
