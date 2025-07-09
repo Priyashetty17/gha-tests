@@ -1,0 +1,114 @@
+name: Platform QA Dispatcher
+
+on:
+  workflow_dispatch:
+    inputs:
+      rancher_host:
+        description: "Rancher cluster host (e.g. mycluster.qa.rancher.space)"
+        required: true
+      admin_token:
+        description: "Admin token for Rancher API access"
+        required: true
+      cluster_name:
+        description: "Downstream cluster name"
+        required: true
+      test_packages:
+        description: "Comma-separated test package paths (e.g. validation/rbac,validation/projects)"
+        required: true
+      run_all_tests:
+        description: "Run all test files in the package?"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      recursive_tests:
+        description: "Recursively find and run tests in sub-packages?"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      test_selector:
+        description: "Test suite or test name regex (e.g. ^TestSuiteName$ or ^TestSuite/TestCase$), if run_all_tests=false"
+        required: false
+      exclude_test_files:
+        description: "Test files to exclude (comma-separated), if run_all_tests=true (e.g. rbac_test.go,projects_test.go)"
+        required: false
+      report_to_qase:
+        description: "Enable Qase reporting"
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+      qase_test_run_id:
+        description: "Qase Test Run ID, if report_to_qase=true"
+        required: false
+
+permissions:
+  contents: read
+  actions: write  
+
+jobs:
+  dispatch-packages:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install GitHub CLI
+        run: |
+            sudo apt update
+            sudo apt install gh -y
+            
+      - name: Dispatch workflows sequentially
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RANCHER_HOST="${{ github.event.inputs.rancher_host }}"
+          ADMIN_TOKEN="${{ github.event.inputs.admin_token }}"
+          CLUSTER_NAME="${{ github.event.inputs.cluster_name }}"
+          TEST_PACKAGES="${{ github.event.inputs.test_packages }}"
+          RUN_ALL="${{ github.event.inputs.run_all_tests }}"
+          RECURSIVE="${{ github.event.inputs.recursive_tests }}"
+          REPORT_QASE="${{ github.event.inputs.report_to_qase }}"
+          TEST_SELECTOR="${{ github.event.inputs.test_selector }}"
+          QASE_RUN_ID="${{ github.event.inputs.qase_test_run_id }}"
+
+          CLEANED_PACKAGES=$(echo "$TEST_PACKAGES" | tr -d '[:space:]')
+          IFS=',' read -ra PACKAGES <<< "$CLEANED_PACKAGES"
+          
+          for PACKAGE in "${PACKAGES[@]}"; do
+            echo "📤 Dispatching runner workflow for package: $PACKAGE"
+            declare -a ARGS=(
+              "workflow"
+              "run"
+              "V3 Platform QA Multi-Package Test Runner with Qase Reporting"
+              "--ref"
+              "main"
+              "-f"
+              "rancher_host=$RANCHER_HOST"
+              "-f"
+              "admin_token=$ADMIN_TOKEN"
+              "-f"
+              "cluster_name=$CLUSTER_NAME"
+              "-f"
+              "test_package=$PACKAGE"
+              "-f"
+              "run_all_tests=$RUN_ALL"
+              "-f"
+              "recursive_tests=$RECURSIVE"
+              "-f"
+              "report_to_qase=$REPORT_QASE"
+            )
+
+            if [[ -n "$TEST_SELECTOR" ]]; then
+              ARGS+=( "-f" "test_selector=$TEST_SELECTOR" )
+            fi
+            
+            if [[ -n "$QASE_RUN_ID" ]]; then
+              ARGS+=( "-f" "qase_test_run_id=$QASE_RUN_ID" )
+            fi
+
+            gh "${ARGS[@]}"
+
+            echo "✅ Dispatched $PACKAGE"
+          done

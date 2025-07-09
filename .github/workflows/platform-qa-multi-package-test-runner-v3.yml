@@ -1,0 +1,182 @@
+name: V3 Platform QA Multi-Package Test Runner with Qase Reporting
+
+on:
+  workflow_dispatch:
+    inputs:
+      rancher_host:
+        description: "Rancher cluster host (e.g. mycluster.qa.rancher.space)"
+        required: true
+      admin_token:
+        description: "Admin token for Rancher API access"
+        required: true
+      cluster_name:
+        description: "Downstream cluster name"
+        required: true
+      test_package:
+        description: "Single test package path (e.g. validation/rbac)"
+        required: true
+      run_all_tests:
+        description: "Run all test files in the package?"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      recursive_tests:
+        description: "Recursively find and run tests in sub-packages?"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      test_selector:
+        description: "Test suite or test name regex (e.g. ^TestSuiteName$ or ^TestSuite/TestCase$), if run_all_tests=false"
+        required: false
+      exclude_test_files:
+        description: "Test files to exclude (comma-separated), if run_all_tests=true (e.g. rbac_test.go,projects_test.go)"
+        required: false
+      report_to_qase:
+        description: "Enable Qase reporting"
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+      qase_test_run_id:
+        description: "Qase Test Run ID, if report_to_qase=true"
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  QUAY_REGISTRY_NAME: ${{ vars.QUAY_REGISTRY_NAME }}
+  QUAY_REGISTRY_USERNAME: ${{ secrets.QUAY_REGISTRY_USERNAME }}
+  QUAY_REGISTRY_PASSWORD: ${{ secrets.QUAY_REGISTRY_PASSWORD }}
+  AWS_ACCESS_KEY: ${{ secrets.AWS_ACCESS_KEY }}
+  AWS_SECRET_KEY: ${{ secrets.AWS_SECRET_KEY }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  RANCHER_ADMIN_PASSWORD: ${{ secrets.RANCHER_ADMIN_PASSWORD }}
+
+jobs:
+  run-tests:
+    runs-on: ubuntu-latest
+    env:
+      RANCHER_HOST: ${{ github.event.inputs.rancher_host }}
+      RANCHER_ADMIN_TOKEN: ${{ github.event.inputs.admin_token }}
+      CLUSTER_NAME: ${{ github.event.inputs.cluster_name }}
+      TEST_PACKAGE: ${{ github.event.inputs.test_package }}
+      RUN_ALL_TESTS: ${{ github.event.inputs.run_all_tests }}
+      RECURSIVE_TESTS: ${{ github.event.inputs.recursive_tests }}
+      EXCLUDE_TEST_FILES: ${{ github.event.inputs.exclude_test_files }}
+      TEST_SELECTOR: ${{ github.event.inputs.test_selector }}
+      REPORT_TO_QASE: ${{ github.event.inputs.report_to_qase }}
+      QASE_TEST_RUN_ID: ${{ github.event.inputs.qase_test_run_id }}
+      QASE_AUTOMATION_TOKEN: ${{ secrets.QASE_TOKEN }}
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
+      - name: Clone rancher/tests repo
+        run: |
+          git clone https://github.com/rancher/tests.git rancher-tests
+          ls -al rancher-tests
+
+      - name: Copy Qase report script to test directory
+        run: cp "${GITHUB_WORKSPACE}/.github/scripts/platform-qa-report-to-qase.sh" "rancher-tests/.github/scripts/"
+
+      - name: Create cattle config
+        run: bash .github/scripts/platform-qa-create-cattle-config.sh
+
+      - name: Show workflow inputs
+        run: |
+          for var in RANCHER_HOST CLUSTER_NAME TEST_PACKAGE RUN_ALL_TESTS TEST_SELECTOR EXCLUDE_TEST_FILES REPORT_TO_QASE QASE_TEST_RUN_ID; do
+            echo "$var = ${!var}"
+          done
+
+      - name: Run test package and report
+        working-directory: rancher-tests
+        env:
+          CATTLE_TEST_CONFIG: ${{ github.workspace }}/cattle-config.yaml
+        run: |
+          export GOTESTSUM_OUTPUT_BUFFER=0
+          REPO_ROOT="${GITHUB_WORKSPACE}/rancher-tests"
+          PACKAGE="$TEST_PACKAGE"
+
+          if [ ! -d "$PACKAGE" ]; then
+            echo "❌ Package $PACKAGE not found. Exiting."
+            exit 1
+          fi
+
+          TAGS="validation"
+
+          if [ "$RUN_ALL_TESTS" = "true" ]; then
+            echo "🔎 Package: $PACKAGE"
+            cd "$REPO_ROOT/$PACKAGE"
+
+            ALL_TEST_FILES=$(ls *_test.go 2>/dev/null | grep -E -v '(^_deprecated_|^deprecated_)' || true)
+
+            FILTERED_TEST_FILES="$ALL_TEST_FILES"
+            if [ -n "$EXCLUDE_TEST_FILES" ]; then
+              EXCLUDE_PATTERN_FILE=$(mktemp)
+              echo "$EXCLUDE_TEST_FILES" | tr ',' '\n' > "$EXCLUDE_PATTERN_FILE"
+              FILTERED_TEST_FILES=$(echo "$FILTERED_TEST_FILES" | tr ' ' '\n' | grep -x -v -f "$EXCLUDE_PATTERN_FILE" | tr '\n' ' ' || true)
+              rm "$EXCLUDE_PATTERN_FILE"
+            fi
+
+            FILTERED_TEST_FILES=$(echo "$FILTERED_TEST_FILES" | xargs)
+
+            if [ -z "$FILTERED_TEST_FILES" ]; then
+              echo "⚠️ No test files found after applying filters. Exiting."
+              exit 0
+            fi
+
+            NON_TEST_GO_FILES=$(ls *.go 2>/dev/null | grep -v '_test.go' || true)
+            FILES_TO_COMPILE_AND_RUN="$FILTERED_TEST_FILES $NON_TEST_GO_FILES"
+
+            echo "$(date +'%T') — 🧪 Running tests in package $PACKAGE"
+            echo "   Files: $FILTERED_TEST_FILES"
+            echo "   With tags: $TAGS"
+
+            stdbuf -oL gotestsum \
+              --format=standard-verbose \
+              --junitfile "$GITHUB_WORKSPACE/rancher-tests/results-${PACKAGE//\//-}.xml" \
+              --jsonfile "$GITHUB_WORKSPACE/rancher-tests/results-${PACKAGE//\//-}.json" \
+              -- -v -tags="$TAGS" -timeout 6h $FILES_TO_COMPILE_AND_RUN || echo "$(date +'%T') ⚠️ Test failed in $PACKAGE"
+
+            if [ "$REPORT_TO_QASE" = "true" ] && [ -n "$QASE_TEST_RUN_ID" ]; then
+              bash "$GITHUB_WORKSPACE/.github/scripts/platform-qa-report-to-qase.sh" \
+                "$GITHUB_WORKSPACE/rancher-tests/results-${PACKAGE//\//-}.json" \
+                "$PACKAGE" \
+                "$QASE_TEST_RUN_ID" \
+                "$QASE_AUTOMATION_TOKEN"
+            fi
+
+          else
+            if [ -z "$TEST_SELECTOR" ]; then
+              echo "❌ test_selector input is required when run_all_tests is false"
+              exit 1
+            fi
+            echo "▶ Running selector: '$TEST_SELECTOR' with tags: $TAGS for package: $PACKAGE"
+
+            stdbuf -oL gotestsum \
+              --format=standard-verbose \
+              --junitfile "$GITHUB_WORKSPACE/rancher-tests/results-${PACKAGE//\//-}.xml" \
+              --jsonfile "$GITHUB_WORKSPACE/rancher-tests/results-${PACKAGE//\//-}.json" \
+              --packages="github.com/rancher/tests/$PACKAGE" \
+              -- -v -tags="$TAGS" -timeout 6h -run "$TEST_SELECTOR" || echo "$(date +'%T')  ⚠️ Test failed in $PACKAGE"
+
+            if [ "$REPORT_TO_QASE" = "true" ] && [ -n "$QASE_TEST_RUN_ID" ]; then
+              bash "$GITHUB_WORKSPACE/.github/scripts/platform-qa-report-to-qase.sh" \
+                "$GITHUB_WORKSPACE/rancher-tests/results-${PACKAGE//\//-}.json" \
+                "$PACKAGE" \
+                "$QASE_TEST_RUN_ID" \
+                "$QASE_AUTOMATION_TOKEN"
+            fi
+          fi
