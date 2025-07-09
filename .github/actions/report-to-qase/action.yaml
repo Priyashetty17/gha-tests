@@ -1,0 +1,42 @@
+name: Report Results to Qase
+description: "Builds reporter and reports to Qase"
+inputs:
+  qase-test-run-id:
+    description: "Qase Test Run ID"
+    required: true
+  qase-automation-token:
+    description: "Qase Automation Token"
+    required: true
+  results-json-path:
+    description: "Path to JSON results file"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - run: |
+        export QASE_TEST_RUN_ID="${{ inputs.qase-test-run-id }}"
+        export QASE_AUTOMATION_TOKEN="${{ inputs.qase-automation-token }}"
+        RESULTS_PATH="${{ inputs.results-json-path }}"
+
+        cd rancher-tests
+        echo "🔧 Building Qase reporter"
+        chmod +x validation/pipeline/scripts/build_qase_reporter.sh
+        ./validation/pipeline/scripts/build_qase_reporter.sh
+
+        REPORTER_PATH="validation/reporter"
+
+        if [ ! -f "$REPORTER_PATH" ]; then
+          echo "❌ Reporter binary not found at $REPORTER_PATH"
+          exit 1
+        fi
+
+        if [ ! -f "$RESULTS_PATH" ]; then
+          echo "❌ $RESULTS_PATH not found. Reporter will fail."
+          exit 1
+        fi
+
+        echo "🚀 Running reporter"
+        chmod +x "$REPORTER_PATH"
+        "$REPORTER_PATH" --results "$RESULTS_PATH"
+      shell: bash

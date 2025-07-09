@@ -1,0 +1,94 @@
+name: Multi-Cluster Test Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      rancher_hosts:
+        description: "Comma-separated Rancher clusters. Example: cluster1.qa.rancher.space, cluster2.qa.rancher.space"
+        required: true
+      admin_tokens:
+        description: "Comma-separated Admin API tokens (same order as Rancher clusters)"
+        required: true
+      cluster_names:
+        description: "Comma-separated downstream cluster names (same order as Rancher clusters)"
+        required: true
+      test_packages:
+        description: "Comma-separated test package paths relative to rancher-tests repo root. Example: validation/rbac, validation/projects"
+        required: true
+      run_all_tests:
+        description: "Run all test files in the package? (true or false)"
+        required: true
+        default: "true"
+        type: choice
+        options: [ "true", "false" ]
+      test_files:
+        description: "Space-separated test files if run_all_tests=false"
+        required: false
+      exclude_test_files:
+        description: "Space-separated test files to exclude if run_all_tests=true"
+        required: false
+      report_to_qase:
+        description: "Enable Qase reporting"
+        required: true
+        default: "true"
+        type: choice
+        options: [ "true", "false" ]
+      qase_test_run_ids:
+        description: "Comma-separated Qase test run IDs (same order as Rancher clusters)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  launch-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Parse Inputs and Dispatch
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const hosts = "${{ github.event.inputs.rancher_hosts }}".split(',');
+            const tokens = "${{ github.event.inputs.admin_tokens }}".split(',');
+            const clusters = "${{ github.event.inputs.cluster_names }}".split(',');
+            const qaseRuns = "${{ github.event.inputs.qase_test_run_ids }}".split(',');
+            const packages = "${{ github.event.inputs.test_packages }}".split(',');
+
+            const runAll = "${{ github.event.inputs.run_all_tests }}";
+            const testFiles = "${{ github.event.inputs.test_files || '' }}";
+            const excludeTestFiles = "${{ github.event.inputs.exclude_test_files || '' }}";
+            const reportToQase = "${{ github.event.inputs.report_to_qase }}";
+
+            if (hosts.length !== tokens.length || tokens.length !== clusters.length || clusters.length !== qaseRuns.length) {
+              throw new Error("Input lengths for rancher_hosts, admin_tokens, cluster_names, and qase_test_run_ids must match");
+            }
+
+            for (let i = 0; i < hosts.length; i++) {
+              const host = hosts[i].trim();
+              const token = tokens[i].trim();
+              const cluster = clusters[i].trim();
+              const qaseRun = qaseRuns[i].trim();
+
+              for (const pkg of packages) {
+                const testPackage = pkg.trim();
+                console.log(`Triggering test for host=${host}, cluster=${cluster}, package=${testPackage}`);
+
+                await github.rest.actions.createWorkflowDispatch({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  workflow_id: 'rancher-test-runner.yml',
+                  ref: 'main',
+                  inputs: {
+                    rancher_host: host,
+                    admin_token: token,
+                    cluster_name: cluster,
+                    test_package: testPackage,
+                    run_all_tests: runAll,
+                    test_files: testFiles,
+                    exclude_test_files: excludeTestFiles,
+                    report_to_qase: reportToQase,
+                    qase_test_run_id: qaseRun
+                  }
+                });
+              }
+            }
