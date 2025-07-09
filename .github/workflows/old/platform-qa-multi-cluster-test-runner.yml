@@ -1,0 +1,125 @@
+name: Platform QA Multi-Cluster Test Runner with Qase Reporting
+
+on:
+  workflow_dispatch:
+    inputs:
+      rancher_hosts:
+        description: "Comma-separated Rancher clusters. Example: cluster1.qa.rancher.space, cluster2.qa.rancher.space"
+        required: true
+      admin_tokens:
+        description: "Comma-separated Admin API tokens (same order as Rancher clusters)"
+        required: true
+      cluster_names:
+        description: "Comma-separated downstream cluster names (same order as Rancher clusters)"
+        required: true
+      test_packages:
+        description: "Comma-separated test package paths (e.g. validation/rbac,validation/projects)"
+        required: true
+      run_all_tests:
+        description: "Run all test files in the package?"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      recursive_tests:
+        description: "Recursively find and run tests in sub-packages?"
+        required: true
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      test_selector:
+        description: "Test suite or test name regex (e.g. ^TestSuiteName$ or ^TestSuite/TestCase$), if run_all_tests=false"
+        required: false
+      exclude_test_files:
+        description: "Test files to exclude (comma-separated), if run_all_tests=true (e.g. rbac_test.go,projects_test.go)"
+        required: false
+      report_to_qase:
+        description: "Enable Qase reporting"
+        required: false
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+      qase_test_run_ids:
+        description: "Comma-separated Qase test run IDs (same order as Rancher clusters), if report_to_qase=true"
+        required: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  launch-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440
+    env:
+      RANCHER_HOSTS: ${{ github.event.inputs.rancher_hosts }}
+      ADMIN_TOKENS: ${{ github.event.inputs.admin_tokens }}
+      CLUSTER_NAMES: ${{ github.event.inputs.cluster_names }}
+      TEST_PACKAGES: ${{ github.event.inputs.test_packages }}
+      RUN_ALL_TESTS: ${{ github.event.inputs.run_all_tests }}
+      RECURSIVE_TESTS: ${{ github.event.inputs.recursive_tests }}
+      TEST_SELECTOR: ${{ github.event.inputs.test_selector || '' }}
+      EXCLUDE_TEST_FILES: ${{ github.event.inputs.exclude_test_files || '' }}
+      REPORT_TO_QASE: ${{ github.event.inputs.report_to_qase }}
+      QASE_TEST_RUN_IDS: ${{ github.event.inputs.qase_test_run_ids || '' }}
+      GH_PAT: ${{ secrets.GH_PAT }}
+
+    steps:
+      - name: Dispatch workflows for each cluster
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_PAT }}
+          script: |
+            const hosts = process.env.RANCHER_HOSTS.split(',').map(s => s.trim());
+            const tokens = process.env.ADMIN_TOKENS.split(',').map(s => s.trim());
+            const clusters = process.env.CLUSTER_NAMES.split(',').map(s => s.trim());
+            const qaseRunsRaw = process.env.QASE_TEST_RUN_IDS;
+            const qaseRuns = qaseRunsRaw ? qaseRunsRaw.split(',').map(s => s.trim()) : [];
+
+            const packages = process.env.TEST_PACKAGES.split(',').map(s => s.trim());
+
+            const runAll = process.env.RUN_ALL_TESTS;
+            const testSelector = process.env.TEST_SELECTOR.trim();
+            const excludeTestFiles = process.env.EXCLUDE_TEST_FILES.trim();
+            const reportToQase = process.env.REPORT_TO_QASE;
+
+            if (hosts.length !== tokens.length || tokens.length !== clusters.length) {
+              throw new Error("Input lengths for rancher_hosts, admin_tokens, and cluster_names must match");
+            }
+            if (reportToQase === "true" && qaseRuns.length !== hosts.length) {
+              throw new Error("Qase test run IDs count must match rancher_hosts count when report_to_qase is true");
+            }
+
+            for (let i = 0; i < hosts.length; i++) {
+              const host = hosts[i];
+              const token = tokens[i];
+              const cluster = clusters[i];
+              const qaseRun = reportToQase === "true" ? qaseRuns[i] : "";
+
+              try {
+                console.log(`Triggering test for host=${host}, cluster=${cluster}, packages=${packages.join(',')}`);
+
+                await github.rest.actions.createWorkflowDispatch({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  workflow_id: 'platform-qa-dispatcher.yml', 
+                  ref: 'main',
+                  inputs: {
+                    rancher_host: host,
+                    admin_token: token,
+                    cluster_name: cluster,
+                    test_packages: packages.join(','),  
+                    run_all_tests: runAll,
+                    recursive_tests: process.env.RECURSIVE_TESTS,
+                    test_selector: testSelector,
+                    exclude_test_files: excludeTestFiles,
+                    report_to_qase: reportToQase,
+                    qase_test_run_id: qaseRun
+                  }
+                });
+
+                console.log(`✅ Successfully triggered for cluster=${cluster}`);
+              } catch (error) {
+                console.error(`❌ Failed to trigger for cluster=${cluster}: ${error.message}`);
+              }
+            }

@@ -1,0 +1,75 @@
+name: "Qase Test Reporter"
+description: "Report Rancher test results to Qase"
+inputs:
+  results_json:
+    description: "Path to results.json from gotestsum"
+    required: true
+  package_name:
+    description: "Name of the test package"
+    required: true
+  qase_test_run_id:
+    description: "Qase Test Run ID"
+    required: true
+  qase_automation_token:
+    description: "Qase API token"
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.results_json }}" ] || [ -z "${{ inputs.package_name }}" ] || \
+           [ -z "${{ inputs.qase_test_run_id }}" ] || [ -z "${{ inputs.qase_automation_token }}" ]; then
+          echo "❌ Missing required inputs"
+          exit 1
+        fi
+        if [ -z "$GITHUB_WORKSPACE" ]; then
+          echo "❌ GITHUB_WORKSPACE must be set"
+          exit 1
+        fi
+
+    - name: Build Qase Reporter
+      shell: bash
+      run: |
+        RESULTS_DIR=$(mktemp -d)
+        echo "RESULTS_DIR=$RESULTS_DIR" >> $GITHUB_ENV
+
+        PACKAGE_SAFE=$(echo "${{ inputs.package_name }}" | tr '/' '_')
+        PACKAGE_RESULTS_JSON="$RESULTS_DIR/results_${PACKAGE_SAFE}.json"
+        cp "${{ inputs.results_json }}" "$PACKAGE_RESULTS_JSON"
+
+        REPORTER_SCRIPT="${GITHUB_WORKSPACE}/rancher-tests/validation/pipeline/scripts/build_qase_reporter.sh"
+        REPORTER_BINARY="${GITHUB_WORKSPACE}/rancher-tests/validation/reporter"
+
+        chmod +x "$REPORTER_SCRIPT"
+        "$REPORTER_SCRIPT" || { echo "❌ Failed to build Qase reporter"; exit 1; }
+
+        if [ ! -f "$REPORTER_BINARY" ]; then
+          echo "❌ Reporter binary not found at $REPORTER_BINARY"
+          exit 1
+        fi
+
+        cp "$PACKAGE_RESULTS_JSON" "$RESULTS_DIR/results.json"
+
+    - name: Run Qase Reporter
+      shell: bash
+      run: |
+        cd "$RESULTS_DIR"
+        chmod +x "${GITHUB_WORKSPACE}/rancher-tests/validation/reporter"
+
+        export QASE_TEST_RUN_ID="${{ inputs.qase_test_run_id }}"
+        export QASE_AUTOMATION_TOKEN="${{ inputs.qase_automation_token }}"
+
+        "${GITHUB_WORKSPACE}/rancher-tests/validation/reporter" --results results.json
+
+    - name: Cleanup
+      shell: bash
+      run: |
+        rm -f "${GITHUB_WORKSPACE}/rancher-tests/results.xml" "${GITHUB_WORKSPACE}/rancher-tests/results.json"
+        rm -rf "$RESULTS_DIR"
+
+    - name: Done
+      shell: bash
+      run: |
+        echo "✅ Test Results have been published to Qase for package: ${{ inputs.package_name }}"
