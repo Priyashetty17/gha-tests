@@ -160,7 +160,7 @@ jobs:
           echo "Generating Tofu main.tf and terraform.tfvars files..."
           cat <<'EOF' > main.tf
           data "aws_route53_zone" "selected" {
-            name = "qa.rancher.space."
+            name = "qa.rancher.space"
             private_zone = false
           }
 

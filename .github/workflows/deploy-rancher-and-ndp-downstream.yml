@@ -145,6 +145,27 @@ jobs:
           echo "Generated unique prefix: $UNIQUE_PREFIX"
           echo "prefix=$UNIQUE_PREFIX" >> $GITHUB_OUTPUT
 
+      - name: Create Terraform TFVars File 
+        run: |
+          echo "Creating terraform.tfvars file..."
+
+          cat > terraform.tfvars <<EOF
+          rancher_hostname_prefix = "${{ steps.generate-prefix.outputs.prefix }}"
+          aws_region              = "${{ github.event.inputs.aws_region }}"
+          aws_ami                 = "${{ github.event.inputs.aws_ami }}"
+          aws_instance_type       = "${{ github.event.inputs.aws_instance_type }}"
+          aws_volume_size         = "${{ github.event.inputs.aws_volume_size }}"
+          aws_volume_type         = "${{ github.event.inputs.aws_volume_type }}"
+          aws_security_group      = "${{ github.event.inputs.aws_security_group }}"
+          aws_subnet              = "${{ github.event.inputs.aws_subnet }}"
+          rancher_api_url         = "${{ github.event.inputs.rancher_api_url }}"
+          rancher_admin_bearer_token = "${{ secrets.RANCHER_ADMIN_TOKEN }}"
+          aws_access_key          = "${{ secrets.AWS_ACCESS_KEY_ID }}"
+          aws_secret_key          = "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          EOF
+
+          echo "terraform.tfvars created successfully!"
+
       - name: Provision RKE2 HA Cluster Infrastructure with Tofu
         id: provision-cluster
         run: |
@@ -564,8 +585,8 @@ jobs:
           resource "rancher2_cloud_credential" "cloud_credential" {
             name = var.cloud_credential_name
             amazonec2_credential_config {
-              access_key = "${{ secrets.AWS_ACCESS_KEY_ID }}"
-              secret_key = "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+              access_key = var.aws_access_key
+              secret_key = var.aws_secret_key
               default_region = var.aws_region
             }
           }
