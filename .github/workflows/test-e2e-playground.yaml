@@ -120,6 +120,7 @@ jobs:
           kubectl get ns >/dev/null
 
       - name: Build and package and push dev images
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.kubeconfig_source == 'create-in-workflow' }}
         env:
           REPO: ${{ env.REPO }}
           VERSION: ${{ env.VERSION }}
@@ -129,6 +130,7 @@ jobs:
           make push
 
       - name: Install k3k
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.kubeconfig_source == 'create-in-workflow' }}
         env:
           REPO: ${{ env.REPO }}
           VERSION: ${{ env.VERSION }}
