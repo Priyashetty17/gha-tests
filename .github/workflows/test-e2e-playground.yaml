@@ -116,7 +116,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          kubectl version --short
+          kubectl version --client=true
           kubectl get ns >/dev/null
 
       - name: Build and package and push dev images
