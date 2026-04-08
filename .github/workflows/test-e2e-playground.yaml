@@ -1,6 +1,8 @@
 name: Tests E2E Playground
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       kubeconfig_source:
@@ -11,8 +13,17 @@ on:
           - create-in-workflow
           - provide-kubeconfig
         default: create-in-workflow
-      e2e_profile:
-        description: E2E test profile to run
+      run_mode:
+        description: Test run mode (auto picks targeted when a test target is provided)
+        required: true
+        type: choice
+        options:
+          - auto
+          - full-suite
+          - targeted
+        default: auto
+      full_suite_profile:
+        description: Full-suite profile (used only when run_mode=full-suite)
         required: true
         type: choice
         options:
@@ -71,16 +82,21 @@ jobs:
           echo "VERSION=1h" >> "$GITHUB_ENV"
 
       - name: Create k3s cluster in workflow
-        if: ${{ inputs.kubeconfig_source == 'create-in-workflow' }}
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.kubeconfig_source == 'create-in-workflow' }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "K3S_HOST_VERSION=${{ inputs.kubernetes_version }}+k3s1" >> "$GITHUB_ENV"
-          curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=${{ inputs.kubernetes_version }}+k3s1 INSTALL_K3S_EXEC="--write-kubeconfig-mode=600" sh -s -
+          k3s_version="v1.35.3"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            k3s_version="${{ inputs.kubernetes_version }}"
+          fi
+
+          echo "K3S_HOST_VERSION=${k3s_version}+k3s1" >> "$GITHUB_ENV"
+          curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION=${k3s_version}+k3s1 INSTALL_K3S_EXEC="--write-kubeconfig-mode=600" sh -s -
           echo "KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> "$GITHUB_ENV"
 
       - name: Use provided kubeconfig from secret
-        if: ${{ inputs.kubeconfig_source == 'provide-kubeconfig' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.kubeconfig_source == 'provide-kubeconfig' }}
         shell: bash
         env:
           HOST_CLUSTER_KUBECONFIG_B64: ${{ secrets.HOST_CLUSTER_KUBECONFIG_B64 }}
@@ -123,13 +139,49 @@ jobs:
         run: |
           set -euo pipefail
 
+          mode="full-suite"
+          profile="regular"
+          test_file=""
+          test_case_name=""
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            mode="${{ inputs.run_mode }}"
+            profile="${{ inputs.full_suite_profile }}"
+            test_file="${{ inputs.test_file }}"
+            test_case_name="${{ inputs.test_case_name }}"
+          fi
+
+          has_target="false"
+          if [[ -n "${test_file}" || -n "${test_case_name}" ]]; then
+            has_target="true"
+          fi
+
           label_filter=""
-          case "${{ inputs.e2e_profile }}" in
-            regular) label_filter='e2e && !slow' ;;
-            slow) label_filter='e2e && slow' ;;
-            all) label_filter='e2e' ;;
+
+          case "${mode}" in
+            auto)
+              if [[ "${has_target}" == "true" ]]; then
+                label_filter='e2e'
+              else
+                label_filter='e2e && !slow'
+              fi
+              ;;
+            targeted)
+              label_filter='e2e'
+              ;;
+            full-suite)
+              case "${profile}" in
+                regular) label_filter='e2e && !slow' ;;
+                slow) label_filter='e2e && slow' ;;
+                all) label_filter='e2e' ;;
+                *)
+                  echo "Unsupported full_suite_profile: ${profile}"
+                  exit 1
+                  ;;
+              esac
+              ;;
             *)
-              echo "Unsupported e2e_profile: ${{ inputs.e2e_profile }}"
+              echo "Unsupported run_mode: ${mode}"
               exit 1
               ;;
           esac
@@ -142,12 +194,12 @@ jobs:
             "--label-filter=${label_filter}"
           )
 
-          if [[ -n "${{ inputs.test_file }}" ]]; then
-            ginkgo_args+=("--focus-file=tests/e2e/${{ inputs.test_file }}")
+          if [[ -n "${test_file}" ]]; then
+            ginkgo_args+=("--focus-file=tests/e2e/${test_file}")
           fi
 
-          if [[ -n "${{ inputs.test_case_name }}" ]]; then
-            ginkgo_args+=("--focus=${{ inputs.test_case_name }}")
+          if [[ -n "${test_case_name}" ]]; then
+            ginkgo_args+=("--focus=${test_case_name}")
           fi
 
           go run github.com/onsi/ginkgo/v2/ginkgo@v2.28.1 "${ginkgo_args[@]}" tests/e2e
@@ -170,7 +222,7 @@ jobs:
           flags: e2e
 
       - name: Export k3s logs
-        if: ${{ always() && inputs.kubeconfig_source == 'create-in-workflow' }}
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.kubeconfig_source == 'create-in-workflow') }}
         run: journalctl -u k3s -o cat --no-pager > /tmp/k3s.log
 
       - name: Export k3k logs
@@ -179,7 +231,7 @@ jobs:
 
       - name: Archive k3s logs
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
-        if: ${{ always() && inputs.kubeconfig_source == 'create-in-workflow' }}
+        if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.kubeconfig_source == 'create-in-workflow') }}
         with:
           name: e2e-playground-k3s-logs
           path: /tmp/k3s.log
